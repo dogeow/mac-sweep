@@ -37,7 +37,7 @@
   const PAGE_SIZE = 100;
   const GROUP_PAGE_SIZE = 30;
   const cleanupModel = window.MacSweepCleanup;
-  const state = { view: 'home', analysisBusy: false, report: null, diskOverview: null, diskUnavailable: false, selected: new Set(), moved: new Set(), failures: new Map(), receipts: [], groups: new Map(), expanded: new Set(), detailPages: new Map(), filter: 'all', search: '', risk: 'all', sort: 'size-desc', page: 1, scanning: false, cancelling: false, cleaning: false, scanRevision: 0, dialogSelection: null, previousFocus: null, message: null, extraWarnings: [] };
+  const state = { view: 'home', analysisBusy: false, report: null, diskOverview: null, diskUnavailable: false, selected: new Set(), moved: new Set(), failures: new Map(), receipts: [], groups: new Map(), expanded: new Set(), expandedTree: new Set(), expandedFileInfo: new Set(), treePages: new Map(), treeNodes: new Map(), filter: 'all', search: '', risk: 'all', sort: 'size-desc', page: 1, scanning: false, cancelling: false, cleaning: false, scanRevision: 0, dialogSelection: null, previousFocus: null, message: null, extraWarnings: [] };
   const bytes = (value) => {
     const number = Number(value) || 0;
     if (number === 0) return '0 B';
@@ -144,22 +144,52 @@
       $('home-result-detail').textContent += ' 检查过程中有提示，查看检查结果了解详情。';
     }
   }
+  function restoreResultFocus(attributes) {
+    const controls = $('result-rows').querySelectorAll('[data-item-id], [data-group-id], [data-tree-id], [data-tree-toggle], [data-file-info], [data-tree-page]');
+    const control = [...controls].find((element) => Object.entries(attributes).every(([key, value]) => element.dataset[key] === value));
+    if (control && !control.disabled) { control.focus({ preventScroll: true }); return true; }
+    return false;
+  }
+  function renderCandidate(item, busy, depth) {
+    const failure = state.failures.get(item.id);
+    const infoOpen = state.expandedFileInfo.has(item.id);
+    return `<div class="tree-file${failure ? ' failed' : ''}" data-tree-depth="${Math.min(depth, 5)}"><div class="tree-file-row"><input type="checkbox" data-item-id="${escape(item.id)}" ${state.selected.has(item.id) ? 'checked' : ''} ${busy ? 'disabled' : ''} aria-label="选择 ${escape(item.name)}" /><span class="tree-file-icon">${icon('file')}</span><strong class="tree-file-name" title="${escape(item.name)}">${escape(item.name)}</strong>${failure ? '<span class="tree-failure-count">未能移动</span>' : ''}<span class="tree-file-size">${bytes(item.bytes)}</span><button class="tree-file-info-button" data-file-info="${escape(item.id)}" aria-expanded="${infoOpen}" aria-label="${infoOpen ? '收起' : '查看'} ${escape(item.name)} 的${failure ? '失败原因与' : ''}文件信息" title="${failure ? '查看失败原因与文件信息' : '查看文件信息'}" ${busy ? 'disabled' : ''}>${icon('info')}</button><button class="row-reveal" data-reveal-id="${escape(item.id)}" title="在 Finder 中显示此项目" aria-label="在 Finder 中显示 ${escape(item.name)}" ${!desktop || demo || busy ? 'disabled' : ''}>${icon('folder')}</button></div>${infoOpen ? `<div class="tree-file-info">${failure ? `<p class="tree-file-error">未能移动：${escape(failure)}</p>` : ''}<p>${escape(item.reason)}</p><code>${escape(item.path)}</code><p class="tree-file-meta">修改于 ${date(item.modifiedAt)} · ${Number(item.files || 0).toLocaleString()} 个文件</p></div>` : ''}</div>`;
+  }
+  function renderTreeFiles(node, key, busy, depth) {
+    if (!node.files.length) return '';
+    const page = cleanupModel.pageItems(node.files, state.treePages.get(key) || 1, PAGE_SIZE);
+    state.treePages.set(key, page.page);
+    const heading = node.children.length ? `<div class="tree-file-section" data-tree-depth="${Math.min(depth, 5)}">此目录内容 · ${node.files.length.toLocaleString()} 项</div>` : '';
+    return heading + page.items.map((item) => renderCandidate(item, busy, depth)).join('') + (page.pages > 1 ? `<div class="tree-file-pagination" data-tree-depth="${Math.min(depth, 5)}"><span>此目录项目 ${page.first}–${page.last} / ${node.files.length.toLocaleString()}</span><button class="page-button" data-tree-page="previous" data-tree-key="${escape(key)}" ${busy || page.page <= 1 ? 'disabled' : ''}>上一页</button><span>${page.page} / ${page.pages}</span><button class="page-button" data-tree-page="next" data-tree-key="${escape(key)}" ${busy || page.page >= page.pages ? 'disabled' : ''}>下一页</button></div>` : '');
+  }
+  function renderTreeDirectory(node, group, busy, depth = 0) {
+    const key = JSON.stringify([group.key, node.key]);
+    state.treeNodes.set(key, { node, groupKey: group.key });
+    const selected = cleanupModel.selectedState(node, state.selected);
+    const open = state.expandedTree.has(key);
+    const failedCount = node.items.filter((item) => state.failures.has(item.id)).length;
+    return `<div class="tree-directory" data-tree-depth="${Math.min(depth, 5)}"><div class="tree-directory-row${selected.count ? ' selected' : ''}"><input type="checkbox" data-tree-id="${escape(key)}" ${selected.checked ? 'checked' : ''} ${busy ? 'disabled' : ''} aria-label="选择 ${escape(node.name)} 下本次找到的全部 ${node.items.length} 项内容" /><button class="tree-directory-toggle" data-tree-toggle="${escape(key)}" aria-expanded="${open}" title="${escape(node.path)}" aria-label="${open ? '收起' : '查看'} ${escape(node.name)} 下的待检查内容" ${busy ? 'disabled' : ''}><span class="tree-directory-icon">${icon('folder')}</span><span class="tree-directory-name"><strong>${escape(node.name)}</strong><small>${node.items.length.toLocaleString()} 项待检查${failedCount ? ` · <span class="tree-failure-count">${failedCount} 项未能移动</span>` : ''}</small></span><span class="tree-directory-size">${bytes(node.bytes)}</span><span class="tree-directory-chevron">${icon('chevron-down')}</span></button></div>${open ? node.children.map((child) => renderTreeDirectory(child, group, busy, depth + 1)).join('') + renderTreeFiles(node, key, busy, depth + 1) : ''}</div>`;
+  }
   function renderGroups(groups, busy, filtered) {
+    state.treeNodes.clear();
     $('result-rows').innerHTML = groups.map((group) => {
       const selected = cleanupModel.selectedState(group, state.selected);
       const failures = group.items.filter((item) => state.failures.has(item.id));
       const open = state.expanded.has(group.key);
-      const detailsPage = cleanupModel.pageItems(group.items, state.detailPages.get(group.key) || 1, PAGE_SIZE);
-      state.detailPages.set(group.key, detailsPage.page);
       const count = `${filtered ? '当前筛选 · ' : ''}${group.items.length.toLocaleString()} 项`;
-      const files = open ? `<div class="group-files"><p class="detail-file-reason">${escape(explanations[group.category] || '')}</p>${detailsPage.items.map((item) => {
-        const failure = state.failures.get(item.id);
-        return `<div class="detail-file${failure ? ' failed' : ''}"><div class="detail-file-heading"><input type="checkbox" data-item-id="${escape(item.id)}" ${state.selected.has(item.id) ? 'checked' : ''} ${busy ? 'disabled' : ''} aria-label="选择 ${escape(item.name)}" /><strong title="${escape(item.name)}">${escape(item.name)}</strong><span>${bytes(item.bytes)}</span><button class="row-reveal" data-reveal-id="${escape(item.id)}" title="在 Finder 中显示" aria-label="在 Finder 中显示 ${escape(item.name)}" ${!desktop || demo || busy ? 'disabled' : ''}>${icon('folder')}</button></div><p class="detail-file-reason">${escape(item.reason)}</p><code class="detail-file-path">${escape(item.path)}</code><p class="detail-file-meta">修改于 ${date(item.modifiedAt)} · ${Number(item.files || 0).toLocaleString()} 个文件</p>${failure ? `<p class="row-error">未能移动：${escape(failure)}</p>` : ''}</div>`;
-      }).join('')}</div>${detailsPage.pages > 1 ? `<div class="group-file-pagination"><span>文件 ${detailsPage.first}–${detailsPage.last} / ${group.items.length}</span><button class="page-button" data-detail-page="previous" data-detail-key="${escape(group.key)}" ${busy || detailsPage.page <= 1 ? 'disabled' : ''}>上一页</button><span>${detailsPage.page} / ${detailsPage.pages}</span><button class="page-button" data-detail-page="next" data-detail-key="${escape(group.key)}" ${busy || detailsPage.page >= detailsPage.pages ? 'disabled' : ''}>下一页</button></div>` : ''}` : '';
-      return `<article class="cleanup-group${selected.count ? ' selected' : ''}${failures.length ? ' failed' : ''}"><div class="group-row"><input type="checkbox" data-group-id="${escape(group.key)}" ${selected.checked ? 'checked' : ''} ${busy || (!group.suggested && !open) ? 'disabled' : ''} aria-label="选择 ${escape(group.name)} 的全部 ${group.items.length} 个匹配项目" /><span class="group-icon ${escape(group.category)}">${icon(categoryIcons[group.category])}</span><div class="group-name"><strong>${escape(group.name)}</strong><span>${escape(labels[group.category] || group.category)} · ${count}</span></div>${!group.suggested ? '<span class="group-badge review">需确认</span>' : ''}<strong class="group-size">${bytes(group.bytes)}</strong></div>${failures.length ? `<p class="group-error">${failures.length} 项未能移动，展开查看原因</p>` : ''}<details class="group-details" data-group-details="${escape(group.key)}" ${open ? 'open' : ''}><summary title="${open ? '收起' : '查看'} ${escape(group.name)} 的文件详情" aria-label="${open ? '收起' : '查看'} ${escape(group.name)} 的文件详情"><span class="sr-only">查看文件详情</span><span class="group-chevron">${icon('chevron-down')}</span></summary>${files}</details></article>`;
+      const tree = open ? cleanupModel.buildDirectoryTree(group.items, state.sort) : [];
+      const directories = open ? `<div class="group-tree"><p class="group-tree-note">${escape(explanations[group.category] || '')} 目录大小只统计本次找到的内容，未列出的文件不会被清理。</p>${tree.map((node) => renderTreeDirectory(node, group, busy)).join('')}</div>` : '';
+      return `<article class="cleanup-group${selected.count ? ' selected' : ''}${failures.length ? ' failed' : ''}"><div class="group-row"><input type="checkbox" data-group-id="${escape(group.key)}" ${selected.checked ? 'checked' : ''} ${busy || (!group.suggested && !open) ? 'disabled' : ''} aria-label="选择 ${escape(group.name)} 的全部 ${group.items.length} 个匹配项目" /><span class="group-icon ${escape(group.category)}">${icon(categoryIcons[group.category])}</span><div class="group-name"><strong>${escape(group.name)}</strong><span>${escape(labels[group.category] || group.category)} · ${count}</span></div>${!group.suggested ? '<span class="group-badge review">需确认</span>' : ''}<strong class="group-size">${bytes(group.bytes)}</strong></div>${failures.length ? `<p class="group-error">${failures.length} 项未能移动，展开查看原因</p>` : ''}<details class="group-details" data-group-details="${escape(group.key)}" ${open ? 'open' : ''}><summary title="${open ? '收起' : '查看'} ${escape(group.name)} 的目录" aria-label="${open ? '收起' : '查看'} ${escape(group.name)} 的目录" aria-disabled="${busy}"><span class="sr-only">查看目录</span><span class="group-chevron">${icon('chevron-down')}</span></summary>${directories}</details></article>`;
     }).join('');
+    $('result-rows').querySelectorAll('[data-tree-depth]').forEach((element) => {
+      element.style.setProperty('--tree-depth', Number(element.dataset.treeDepth));
+    });
     $('result-rows').querySelectorAll('[data-group-id]').forEach((checkbox) => {
       checkbox.indeterminate = cleanupModel.selectedState(state.groups.get(checkbox.dataset.groupId), state.selected).indeterminate;
+    });
+    $('result-rows').querySelectorAll('[data-tree-id]').forEach((checkbox) => {
+      const entry = state.treeNodes.get(checkbox.dataset.treeId);
+      checkbox.indeterminate = cleanupModel.selectedState(entry.node, state.selected).indeterminate;
     });
   }
   function render() {
@@ -264,7 +294,10 @@
     state.moved.clear();
     state.failures.clear();
     state.expanded.clear();
-    state.detailPages.clear();
+    state.expandedTree.clear();
+    state.expandedFileInfo.clear();
+    state.treePages.clear();
+    state.treeNodes.clear();
     state.page = 1;
   }
   async function scan() {
@@ -442,42 +475,67 @@
     $('next-page').addEventListener('click', () => { if (state.page >= Math.ceil(cleanupModel.groupItems(visibleItems(), state.sort).length / GROUP_PAGE_SIZE)) return; state.page += 1; render(); $('result-table').scrollIntoView({ block: 'start' }); });
     $('result-rows').addEventListener('change', (event) => {
       if (state.scanning || state.cleaning || state.analysisBusy) return;
-      const checkbox = event.target.closest('[data-item-id], [data-group-id]');
-      if (!checkbox) return;
-      const group = checkbox.dataset.groupId ? state.groups.get(checkbox.dataset.groupId) : null;
+      const checkbox = event.target.closest('[data-item-id], [data-group-id], [data-tree-id]');
+      if (!checkbox || checkbox.disabled) return;
+      const tree = checkbox.dataset.treeId ? state.treeNodes.get(checkbox.dataset.treeId) : null;
+      const group = tree ? state.groups.get(tree.groupKey) : checkbox.dataset.groupId ? state.groups.get(checkbox.dataset.groupId) : null;
+      if ((checkbox.dataset.treeId && !tree) || (checkbox.dataset.groupId && !group)) return;
       if (group && !group.suggested && !state.expanded.has(group.key)) return;
-      const targets = group ? group.items : activeItems().filter((item) => item.id === checkbox.dataset.itemId);
+      const targets = tree ? tree.node.items : group ? group.items : visibleItems().filter((item) => item.id === checkbox.dataset.itemId);
       targets.forEach((item) => { if (checkbox.checked) state.selected.add(item.id); else state.selected.delete(item.id); });
-      const id = checkbox.dataset.itemId || checkbox.dataset.groupId;
-      const attribute = checkbox.dataset.itemId ? 'itemId' : 'groupId';
+      const attribute = tree ? 'treeId' : group ? 'groupId' : 'itemId';
+      const id = checkbox.dataset[attribute];
       render();
-      const replacement = Array.from($('result-rows').querySelectorAll('[data-item-id], [data-group-id]')).find((el) => el.dataset[attribute] === id);
-      replacement?.focus({ preventScroll: true });
+      restoreResultFocus({ [attribute]: id });
     });
     $('result-rows').addEventListener('toggle', (event) => {
       const details = event.target;
       if (!details.matches('[data-group-details]')) return;
       const key = details.dataset.groupDetails;
       if (!state.groups.has(key) || details.open === state.expanded.has(key)) return;
+      if (state.scanning || state.cleaning || state.analysisBusy) { details.open = state.expanded.has(key); return; }
       if (details.open) state.expanded.add(key); else state.expanded.delete(key);
       render();
       const replacement = [...$('result-rows').querySelectorAll('[data-group-details]')].find((el) => el.dataset.groupDetails === key);
       replacement?.querySelector('summary')?.focus({ preventScroll: true });
     }, true);
     $('result-rows').addEventListener('click', (event) => {
-      const pageButton = event.target.closest('[data-detail-page]');
-      if (pageButton) {
-        if (pageButton.disabled || state.scanning || state.cleaning || state.analysisBusy) return;
-        const key = pageButton.dataset.detailKey;
-        const group = state.groups.get(key);
-        if (!group) return;
-        const page = cleanupModel.pageItems(group.items, state.detailPages.get(key) || 1, PAGE_SIZE);
-        state.detailPages.set(key, page.page + (pageButton.dataset.detailPage === 'next' ? 1 : -1));
+      if (state.scanning || state.cleaning || state.analysisBusy) {
+        if (event.target.closest('[data-group-details] > summary')) event.preventDefault();
+        return;
+      }
+      const treeButton = event.target.closest('[data-tree-toggle]');
+      if (treeButton) {
+        const key = treeButton.dataset.treeToggle;
+        if (!state.treeNodes.has(key) || treeButton.disabled) return;
+        if (state.expandedTree.has(key)) state.expandedTree.delete(key); else state.expandedTree.add(key);
         render();
+        restoreResultFocus({ treeToggle: key });
+        return;
+      }
+      const infoButton = event.target.closest('[data-file-info]');
+      if (infoButton) {
+        const id = infoButton.dataset.fileInfo;
+        if (infoButton.disabled || !visibleItems().some((item) => item.id === id)) return;
+        if (state.expandedFileInfo.has(id)) state.expandedFileInfo.delete(id); else state.expandedFileInfo.add(id);
+        render();
+        restoreResultFocus({ fileInfo: id });
+        return;
+      }
+      const pageButton = event.target.closest('[data-tree-page]');
+      if (pageButton) {
+        if (pageButton.disabled) return;
+        const key = pageButton.dataset.treeKey;
+        const entry = state.treeNodes.get(key);
+        if (!entry) return;
+        const page = cleanupModel.pageItems(entry.node.files, state.treePages.get(key) || 1, PAGE_SIZE);
+        state.treePages.set(key, page.page + (pageButton.dataset.treePage === 'next' ? 1 : -1));
+        render();
+        if (!restoreResultFocus({ treePage: pageButton.dataset.treePage, treeKey: key })) restoreResultFocus({ treePage: pageButton.dataset.treePage === 'next' ? 'previous' : 'next', treeKey: key });
         return;
       }
       const button = event.target.closest('[data-reveal-id]');
-      if (button) revealItem(button.dataset.revealId);
+      if (button && !button.disabled) revealItem(button.dataset.revealId);
     });
     $('select-all').addEventListener('change', (event) => { if (state.scanning || state.cleaning || state.analysisBusy) return; currentPageItems().filter((item) => item.selectedByDefault === true).forEach((item) => { if (event.target.checked) state.selected.add(item.id); else state.selected.delete(item.id); }); render(); });
     $('select-safe').addEventListener('click', () => { if (state.scanning || state.cleaning || state.analysisBusy) return; activeItems().filter((item) => item.selectedByDefault === true).forEach((item) => state.selected.add(item.id)); render(); });

@@ -2,6 +2,7 @@
 //! Allocated blocks include directory/link storage. Multiply-linked regular files
 //! are counted once per inode; APFS shared extents cannot be deduplicated here.
 
+use crate::analysis_cache::{BoundedDirectorySummaries, DirectorySummary, DirectorySummaryIndex};
 use serde::Serialize;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashSet};
@@ -19,6 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const DISPLAY_DEPTH: usize = 3;
 const DISPLAY_CHILDREN: usize = 300;
 const DISPLAY_NODES: u64 = 15_000;
+const DIRECTORY_SUMMARIES: usize = 20_000;
 const MAX_DEPTH: usize = 256;
 // macOS SDK sys/stat.h: SF_DATALESS marks a File Provider object whose content
 // is online. Enumerating an online directory/package can trigger hydration.
@@ -44,6 +46,12 @@ pub struct DirectoryNode {
     pub has_children: bool,
     pub partial: bool,
     pub omitted_children: u64,
+    pub size_known: bool,
+    pub size_source: String,
+    #[serde(skip)]
+    device: u64,
+    #[serde(skip)]
+    inode: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -68,6 +76,12 @@ pub struct AnalysisReport {
     pub cloud_placeholder_count: u64,
     /// Protected personal/app directories left unread after OS timeouts or exhausted slots.
     pub blocked_directory_count: u64,
+    pub cached_browse: bool,
+    pub source_analysis_id: String,
+    /// Source full analysis completion time, in Unix milliseconds.
+    pub measured_at: u64,
+    #[serde(skip)]
+    pub summary_index: Arc<DirectorySummaryIndex>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -119,6 +133,358 @@ impl Ord for Displayed {
     }
 }
 
+impl DirectoryNode {
+    pub(crate) fn filesystem_identity(&self) -> (u64, u64) {
+        (self.device, self.inode)
+    }
+
+    fn shallow_clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            path: self.path.clone(),
+            name: self.name.clone(),
+            kind: self.kind.clone(),
+            bytes: self.bytes,
+            files: self.files,
+            dirs: self.dirs,
+            children: Vec::new(),
+            has_children: self.has_children,
+            partial: self.partial,
+            omitted_children: 0,
+            size_known: self.size_known,
+            size_source: self.size_source.clone(),
+            device: self.device,
+            inode: self.inode,
+        }
+    }
+}
+
+/// Only a directory already present in the registered report can be browsed.
+/// The shared source index additionally bounds its filesystem/path authority.
+pub fn directory_for_browse(
+    report: &AnalysisReport,
+    node_id: &str,
+) -> Result<DirectoryNode, String> {
+    let mut pending = vec![&report.root];
+    while let Some(node) = pending.pop() {
+        if node.id == node_id {
+            if node.kind != "directory"
+                || node.path.is_empty()
+                || !report.summary_index.contains_scope(Path::new(&node.path))
+                || node.device != report.summary_index.device
+            {
+                return Err("ANALYSIS_NODE_CHANGED:此目录已变化，请重新分析。".into());
+            }
+            return Ok(node.shallow_clone());
+        }
+        pending.extend(&node.children);
+    }
+    Err("ANALYSIS_NODE_CHANGED:此目录已变化，请重新分析。".into())
+}
+
+fn browse_path_error(error: io::Error) -> String {
+    if error.kind() == io::ErrorKind::NotFound {
+        "ANALYSIS_NODE_MISSING:此目录已被移动或删除。".into()
+    } else if error.kind() == io::ErrorKind::NotADirectory
+        || error.raw_os_error() == Some(libc::ELOOP)
+    {
+        "ANALYSIS_NODE_CHANGED:此目录已变化，请重新分析。".into()
+    } else if error.kind() == io::ErrorKind::PermissionDenied {
+        "无法读取这个目录，请检查访问权限。".into()
+    } else {
+        format!("无法读取目录信息，请稍后重试：{error}")
+    }
+}
+
+fn directory_failure<F: Fn(AnalysisProgress)>(
+    ctx: &mut Context<'_, F>,
+    path: &Path,
+    failure: DirectoryReadFailure,
+) {
+    match failure {
+        DirectoryReadFailure::Io(error) => {
+            ctx.record_error(&error);
+            ctx.warn(format!(
+                "无法列出 {}：{}。目录内容未读取。",
+                path.display(),
+                error
+            ));
+        }
+        DirectoryReadFailure::TimedOut | DirectoryReadFailure::WorkerLimit => {
+            ctx.blocked_directory_count += 1;
+            ctx.other_error_count += 1;
+            let reason = if matches!(failure, DirectoryReadFailure::TimedOut) {
+                "系统未及时返回目录内容"
+            } else {
+                "此前受保护目录仍未返回，等待线程达到限额，此目录暂未读取"
+            };
+            ctx.warn(format!(
+                "{}：{reason}。可以检查完整磁盘访问权限后重试。",
+                path.display()
+            ));
+        }
+        DirectoryReadFailure::Cancelled => ctx.stopped = true,
+    }
+}
+
+/// Recover only directory entries already measured beneath this exact parent.
+/// No filesystem calls occur here, and an absent file/summary is never invented.
+fn cached_direct_subdirs(
+    index: &DirectorySummaryIndex,
+    parent: &Path,
+    cancel: &AtomicBool,
+) -> (BinaryHeap<Displayed>, u64) {
+    let mut rows = BinaryHeap::new();
+    let mut count = 0;
+    if !index.contains_scope(parent) {
+        return (rows, count);
+    }
+    for summary in index.entries.values() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let path = Path::new(&summary.path);
+        if path.parent() != Some(parent)
+            || !index.contains_scope(path)
+            || summary.device != index.device
+        {
+            continue;
+        }
+        count += 1;
+        rows.push(Displayed {
+            node: DirectoryNode {
+                id: summary.id.clone(),
+                path: summary.path.clone(),
+                name: summary.name.clone(),
+                kind: "directory".into(),
+                bytes: summary.bytes,
+                files: summary.files,
+                dirs: summary.dirs,
+                children: Vec::new(),
+                has_children: summary.has_children,
+                partial: summary.partial,
+                omitted_children: 0,
+                size_known: summary.size_known,
+                size_source: "cached".into(),
+                device: summary.device,
+                inode: summary.inode,
+            },
+            nodes: 1,
+        });
+        if rows.len() > DISPLAY_CHILDREN {
+            rows.pop();
+        }
+    }
+    (rows, count)
+}
+
+/// Read only immediate entries. Folder totals come from the bounded source cache;
+/// a missing summary is explicitly unknown and never starts a recursive scan.
+pub fn browse(
+    selected: DirectoryNode,
+    index: Arc<DirectorySummaryIndex>,
+    total_bytes: u64,
+    available_bytes: u64,
+    cancel: &AtomicBool,
+) -> Result<AnalysisReport, String> {
+    let path = Path::new(&selected.path);
+    if selected.kind != "directory"
+        || !index.contains_scope(path)
+        || selected.device != index.device
+    {
+        return Err("ANALYSIS_NODE_CHANGED:此目录已变化，请重新分析。".into());
+    }
+    let source_root = Path::new(&index.root);
+    let current_root = source_root.canonicalize().map_err(browse_path_error)?;
+    let current_path = path.canonicalize().map_err(browse_path_error)?;
+    if current_root != source_root
+        || current_path != path
+        || !current_path.starts_with(&current_root)
+    {
+        return Err("ANALYSIS_NODE_CHANGED:此目录已变化，请重新分析。".into());
+    }
+    // Validate the current resolution as well as the selected inode. The path
+    // can still change after this check; this is not a filesystem snapshot.
+    let metadata = fs::symlink_metadata(path).map_err(browse_path_error)?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.dev() != selected.device
+        || metadata.ino() != selected.inode
+    {
+        return Err("ANALYSIS_NODE_CHANGED:此目录已变化，请重新分析。".into());
+    }
+    let analysis_id = format!(
+        "browse-{}-{}",
+        std::process::id(),
+        NEXT_ANALYSIS.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut ctx = Context::new(cancel, |_| {}, analysis_id.clone(), index.device);
+    let mut root = selected.shallow_clone();
+    if root.size_known {
+        root.size_source = "cached".into();
+    }
+    let mut rows = BinaryHeap::new();
+    let mut direct_count = 0_u64;
+    let mut listing_partial = false;
+    if !ctx.check() {
+        listing_partial = true;
+    } else if is_cloud_placeholder(&metadata) {
+        ctx.record_metadata(&metadata, true);
+        listing_partial = true;
+        root.has_children = false;
+    } else {
+        match directory_entries(path, cancel) {
+            Err(failure) => {
+                let use_cache = matches!(
+                    failure,
+                    DirectoryReadFailure::TimedOut | DirectoryReadFailure::WorkerLimit
+                );
+                directory_failure(&mut ctx, path, failure);
+                listing_partial = true;
+                if use_cache {
+                    (rows, direct_count) = cached_direct_subdirs(&index, path, cancel);
+                    ctx.warn("实时目录未读到，仅显示已有统计中的子目录，列表可能有遗漏。".into());
+                }
+            }
+            Ok((mut entries, truncated)) => {
+                listing_partial |= truncated;
+                if truncated {
+                    ctx.warn("直属项目达到显示读取上限，部分项目没有列出。".into());
+                }
+                loop {
+                    if !ctx.check() {
+                        listing_partial = true;
+                        break;
+                    }
+                    let Some(entry) = entries.next() else {
+                        break;
+                    };
+                    direct_count += 1;
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            ctx.record_error(&error);
+                            ctx.warn(format!("无法读取直属项目：{error}"));
+                            listing_partial = true;
+                            continue;
+                        }
+                    };
+                    let metadata = match entry.metadata() {
+                        Ok(metadata) => metadata,
+                        Err(error) => {
+                            ctx.record_error(&error);
+                            ctx.warn(format!("无法读取直属项目信息：{error}"));
+                            listing_partial = true;
+                            continue;
+                        }
+                    };
+                    let child_path = entry.path();
+                    let child_string = child_path.to_str().unwrap_or_default().to_owned();
+                    let directory = metadata.is_dir();
+                    let cloud = is_cloud_placeholder(&metadata);
+                    let own = ctx.record_metadata(&metadata, cloud);
+                    let cached = index.lookup(&child_string).filter(|summary| {
+                        directory
+                            && summary.device == metadata.dev()
+                            && summary.inode == metadata.ino()
+                    });
+                    let mut child = DirectoryNode {
+                        id: format!("{analysis_id}-{direct_count}"),
+                        path: child_string,
+                        name: entry.file_name().to_string_lossy().into_owned(),
+                        kind: if metadata.file_type().is_symlink() {
+                            "symlink"
+                        } else if directory {
+                            "directory"
+                        } else {
+                            "file"
+                        }
+                        .into(),
+                        bytes: if directory { 0 } else { own.bytes },
+                        files: own.files,
+                        dirs: own.dirs,
+                        children: Vec::new(),
+                        has_children: directory && !cloud && metadata.dev() == index.device,
+                        partial: directory,
+                        omitted_children: 0,
+                        size_known: !directory,
+                        size_source: if directory { "unknown" } else { "stat" }.into(),
+                        device: metadata.dev(),
+                        inode: metadata.ino(),
+                    };
+                    if let Some(cached) = cached {
+                        child.id = cached.id.clone();
+                        child.name = cached.name.clone();
+                        child.bytes = cached.bytes;
+                        child.files = cached.files;
+                        child.dirs = cached.dirs;
+                        child.partial = cached.partial;
+                        child.size_known = cached.size_known;
+                        child.size_source = if cached.size_known {
+                            "cached"
+                        } else {
+                            "unknown"
+                        }
+                        .into();
+                        child.has_children = cached.has_children && !cloud;
+                    }
+                    if directory && metadata.dev() != index.device {
+                        ctx.skipped_mount_count += 1;
+                        child.size_known = false;
+                        child.size_source = "unknown".into();
+                        child.bytes = 0;
+                        ctx.warn(format!(
+                            "{} 属于另一挂载卷，没有继续读取。",
+                            child_path.display()
+                        ));
+                    }
+                    rows.push(Displayed {
+                        node: child,
+                        nodes: 1,
+                    });
+                    if rows.len() > DISPLAY_CHILDREN {
+                        rows.pop();
+                    }
+                }
+            }
+        }
+    }
+    let mut children = rows.into_vec();
+    children.sort_by(|left, right| {
+        right
+            .node
+            .bytes
+            .cmp(&left.node.bytes)
+            .then_with(|| left.node.path.cmp(&right.node.path))
+    });
+    root.omitted_children = direct_count.saturating_sub(children.len() as u64);
+    root.children = children.into_iter().map(|row| row.node).collect();
+    root.partial |= listing_partial;
+    let cancelled = cancel.load(Ordering::Relaxed);
+    Ok(AnalysisReport {
+        analysis_id,
+        root,
+        duration_ms: ctx.started.elapsed().as_millis() as u64,
+        scanned_files: ctx.files,
+        warnings: ctx.warnings,
+        cancelled,
+        total_bytes,
+        available_bytes,
+        scan_complete: false,
+        permission_denied_count: ctx.permission_denied_count,
+        other_error_count: ctx.other_error_count,
+        skipped_mount_count: ctx.skipped_mount_count,
+        changed_directory_count: 0,
+        depth_limited_count: 0,
+        cloud_placeholder_count: ctx.cloud_placeholder_count,
+        blocked_directory_count: ctx.blocked_directory_count,
+        cached_browse: true,
+        source_analysis_id: index.source_analysis_id.clone(),
+        measured_at: index.measured_at,
+        summary_index: index,
+    })
+}
+
 struct Context<'a, F: Fn(AnalysisProgress)> {
     cancel: &'a AtomicBool,
     progress: F,
@@ -142,6 +508,7 @@ struct Context<'a, F: Fn(AnalysisProgress)> {
     depth_limited_count: u64,
     cloud_placeholder_count: u64,
     blocked_directory_count: u64,
+    summaries: BoundedDirectorySummaries,
 }
 
 impl<F: Fn(AnalysisProgress)> Context<'_, F> {
@@ -168,6 +535,7 @@ impl<F: Fn(AnalysisProgress)> Context<'_, F> {
             depth_limited_count: 0,
             cloud_placeholder_count: 0,
             blocked_directory_count: 0,
+            summaries: BoundedDirectorySummaries::new(DIRECTORY_SUMMARIES),
         }
     }
 
@@ -691,6 +1059,28 @@ fn measure_metadata_with_policy<F: Fn(AnalysisProgress)>(
             }
         }
     }
+    let has_children = directory && !cloud_placeholder && (totals.children > 0 || totals.partial);
+    let size_known = !totals.partial || totals.bytes > 0;
+    if directory && ctx.summaries.should_consider(totals.bytes, path) {
+        if let Some(path_string) = path.to_str() {
+            ctx.summaries.consider(DirectorySummary {
+                id: format!("{}-{node_visit}", ctx.analysis_id),
+                path: path_string.to_owned(),
+                name: path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "/".into()),
+                bytes: totals.bytes,
+                files: totals.files,
+                dirs: totals.dirs,
+                has_children,
+                partial: totals.partial,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                size_known,
+            });
+        }
+    }
     let displayed = if retain {
         if path.to_str().is_none() {
             ctx.warn(format!(
@@ -730,11 +1120,13 @@ fn measure_metadata_with_policy<F: Fn(AnalysisProgress)>(
                 files: totals.files,
                 dirs: totals.dirs,
                 children: children.into_iter().map(|child| child.node).collect(),
-                has_children: directory
-                    && !cloud_placeholder
-                    && (totals.children > 0 || totals.partial),
+                has_children,
                 partial: totals.partial,
                 omitted_children,
+                size_known,
+                size_source: "scan".into(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
             },
         })
     } else {
@@ -813,9 +1205,25 @@ pub fn analyze(
             has_children: true,
             partial: true,
             omitted_children: 0,
+            size_known: false,
+            size_source: "unknown".into(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
         });
     let scan_complete = !root.partial && !cancelled;
+    let measured_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let summary_index = Arc::new(ctx.summaries.finish(
+        analysis_id.clone(),
+        path.to_string_lossy().into_owned(),
+        metadata.dev(),
+        measured_at,
+    ));
+    debug_assert!(summary_index.len() <= DIRECTORY_SUMMARIES);
     Ok(AnalysisReport {
+        source_analysis_id: analysis_id.clone(),
         analysis_id,
         root,
         duration_ms: ctx.started.elapsed().as_millis() as u64,
@@ -832,6 +1240,9 @@ pub fn analyze(
         depth_limited_count: ctx.depth_limited_count,
         cloud_placeholder_count: ctx.cloud_placeholder_count,
         blocked_directory_count: ctx.blocked_directory_count,
+        cached_browse: false,
+        measured_at,
+        summary_index,
     })
 }
 
@@ -1342,5 +1753,307 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(500));
         canceller.join().unwrap();
         wait_for_directory_workers();
+    }
+
+    #[test]
+    fn cached_browse_lists_only_immediate_entries_and_keeps_source_directory_totals() {
+        let fixture = Fixture::new();
+        fixture.file("a/b/c/d/inside/old.bin", 32_768);
+        let full = analyze(&fixture.0, &AtomicBool::new(false), |_| {}).unwrap();
+        let target = &full.root.children[0].children[0].children[0];
+        assert!(target.children.is_empty());
+        let selected = directory_for_browse(&full, &target.id).unwrap();
+        let cached_bytes = selected.bytes;
+        // Changing a grandchild after the full scan proves browse does not walk
+        // it again, even though its existing summary is retained for display.
+        fixture.file("a/b/c/d/inside/arrived.bin", 65_536);
+        let browsed = browse(
+            selected,
+            Arc::clone(&full.summary_index),
+            full.total_bytes,
+            full.available_bytes,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(browsed.cached_browse);
+        assert_eq!(browsed.root.id, target.id);
+        assert_eq!(browsed.root.bytes, cached_bytes);
+        assert_eq!(browsed.root.size_source, "cached");
+        assert_eq!(browsed.scanned_files, 0);
+        assert_eq!(browsed.root.children.len(), 1);
+        let directory = &browsed.root.children[0];
+        assert_eq!(directory.name, "d");
+        assert!(directory.children.is_empty());
+        assert_eq!(directory.files, 1);
+        assert!(directory.size_known);
+        assert_eq!(directory.size_source, "cached");
+        assert_eq!(browsed.measured_at, full.measured_at);
+        assert_eq!(browsed.source_analysis_id, full.analysis_id);
+        assert!(Arc::ptr_eq(&browsed.summary_index, &full.summary_index));
+        assert!(fixture.0.join("a/b/c/d/inside/old.bin").exists());
+        assert!(fixture.0.join("a/b/c/d/inside/arrived.bin").exists());
+        let value = serde_json::to_value(&browsed).unwrap();
+        assert!(value.get("summaryIndex").is_none());
+        assert!(value.get("storage").is_none());
+        assert!(value["root"].get("device").is_none());
+    }
+
+    #[test]
+    fn uncached_new_directories_have_unknown_sizes_and_can_be_opened_shallowly() {
+        let fixture = Fixture::new();
+        fixture.file("known/file.bin", 4_096);
+        let full = analyze(&fixture.0, &AtomicBool::new(false), |_| {}).unwrap();
+        fixture.file("new/deep/never-recursed.bin", 32_768);
+        let browsed = browse(
+            directory_for_browse(&full, &full.root.id).unwrap(),
+            Arc::clone(&full.summary_index),
+            full.total_bytes,
+            full.available_bytes,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let unknown = browsed
+            .root
+            .children
+            .iter()
+            .find(|node| node.name == "new")
+            .unwrap();
+        assert!(!unknown.size_known);
+        assert_eq!(unknown.size_source, "unknown");
+        assert!(unknown.partial);
+        assert_eq!(unknown.bytes, 0);
+        assert!(unknown.has_children);
+        let next = browse(
+            directory_for_browse(&browsed, &unknown.id).unwrap(),
+            Arc::clone(&browsed.summary_index),
+            full.total_bytes,
+            full.available_bytes,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(next.root.children.len(), 1);
+        assert_eq!(next.root.children[0].name, "deep");
+        assert!(!next.root.children[0].size_known);
+        assert_eq!(next.scanned_files, 0);
+        assert!(!next.root.size_known);
+    }
+
+    #[test]
+    fn browse_authorization_rejects_hidden_ids_other_scopes_and_replaced_directories() {
+        let fixture = Fixture::new();
+        fixture.file("a/b/c/d/inside.bin", 4_096);
+        let full = analyze(&fixture.0, &AtomicBool::new(false), |_| {}).unwrap();
+        let hidden = full
+            .summary_index
+            .lookup(fixture.0.join("a/b/c/d").to_str().unwrap())
+            .unwrap();
+        assert!(directory_for_browse(&full, &hidden.id).is_err());
+        assert!(directory_for_browse(&full, "not-a-cached-id").is_err());
+        let mut outside = full.clone();
+        outside.root.path = format!("{}-old", fixture.0.display());
+        assert!(directory_for_browse(&outside, &outside.root.id).is_err());
+        let target = &full.root.children[0];
+        let selected = directory_for_browse(&full, &target.id).unwrap();
+        fs::rename(fixture.0.join("a"), fixture.0.join("original-a")).unwrap();
+        fs::create_dir(fixture.0.join("a")).unwrap();
+        assert!(browse(
+            selected,
+            Arc::clone(&full.summary_index),
+            full.total_bytes,
+            full.available_bytes,
+            &AtomicBool::new(false)
+        )
+        .is_err());
+        assert!(fixture.0.join("original-a/b/c/d/inside.bin").exists());
+    }
+
+    #[test]
+    fn cancelled_browse_preserves_cached_totals_without_reading_descendants() {
+        let fixture = Fixture::new();
+        fixture.file("a/b/c/keep.bin", 4_096);
+        let full = analyze(&fixture.0, &AtomicBool::new(false), |_| {}).unwrap();
+        let cancelled = browse(
+            directory_for_browse(&full, &full.root.id).unwrap(),
+            Arc::clone(&full.summary_index),
+            full.total_bytes,
+            full.available_bytes,
+            &AtomicBool::new(true),
+        )
+        .unwrap();
+        assert!(cancelled.cancelled);
+        assert!(cancelled.root.children.is_empty());
+        assert_eq!(cancelled.root.bytes, full.root.bytes);
+        assert_eq!(cancelled.scanned_files, 0);
+        assert!(fixture.0.join("a/b/c/keep.bin").exists());
+    }
+
+    #[test]
+    fn exhausted_directory_workers_fall_back_to_authorized_cached_directories_only() {
+        let _lock = DIRECTORY_WORKER_TEST_LOCK.lock().unwrap();
+        wait_for_directory_workers();
+        let fixture = Fixture::new();
+        fixture.file("Users/example/Library/direct/grandchild/keep.bin", 32_768);
+        fixture.file("Users/example/Library/other/keep.bin", 8_192);
+        fixture.file("Users/example/Library/direct-file.log", 4_096);
+        let full = analyze(&fixture.0, &AtomicBool::new(false), |_| {}).unwrap();
+        wait_for_directory_workers();
+        let target = &full.root.children[0].children[0].children[0];
+        assert_eq!(target.name, "Library");
+        fixture.file("Users/example/Library/new/uncached.bin", 16_384);
+        // Reserve all slots without blocking any real operating-system worker.
+        let slots: Vec<_> = (0..MAX_DIRECTORY_WORKERS)
+            .map(|_| DirectoryWorkerSlot::reserve().unwrap())
+            .collect();
+        let browsed = browse(
+            directory_for_browse(&full, &target.id).unwrap(),
+            Arc::clone(&full.summary_index),
+            full.total_bytes,
+            full.available_bytes,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        drop(slots);
+        assert_eq!(browsed.blocked_directory_count, 1);
+        assert_eq!(browsed.other_error_count, 1);
+        assert!(browsed.root.partial);
+        assert!(browsed.cached_browse);
+        assert_eq!(browsed.root.bytes, target.bytes);
+        assert_eq!(browsed.scanned_files, 0);
+        let names: HashSet<_> = browsed
+            .root
+            .children
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect();
+        assert_eq!(names, HashSet::from(["direct", "other"]));
+        assert!(browsed
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("列表可能有遗漏")));
+        assert!(Arc::ptr_eq(&browsed.summary_index, &full.summary_index));
+        for node in &browsed.root.children {
+            assert_eq!(node.kind, "directory");
+            assert_eq!(node.size_source, "cached");
+            assert!(node.children.is_empty());
+            assert_eq!(node.id, full.summary_index.lookup(&node.path).unwrap().id);
+            assert!(directory_for_browse(&browsed, &node.id).is_ok());
+        }
+        assert!(fixture
+            .0
+            .join("Users/example/Library/direct/grandchild/keep.bin")
+            .exists());
+        assert!(fixture
+            .0
+            .join("Users/example/Library/new/uncached.bin")
+            .exists());
+        wait_for_directory_workers();
+    }
+
+    #[test]
+    fn cached_directories_fallback_is_bounded_and_uses_exact_parent_and_scope() {
+        let fixture = Fixture::new();
+        fixture.file("parent/child/grandchild/keep.bin", 4_096);
+        fixture.file("parent-old/sibling/keep.bin", 4_096);
+        let full = analyze(&fixture.0, &AtomicBool::new(false), |_| {}).unwrap();
+        let parent = fixture.0.join("parent");
+        let (rows, count) =
+            cached_direct_subdirs(&full.summary_index, &parent, &AtomicBool::new(false));
+        assert_eq!(count, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows.peek().unwrap().node.path,
+            parent.join("child").to_str().unwrap()
+        );
+        assert!(cached_direct_subdirs(
+            &full.summary_index,
+            Path::new(&format!("{}-old", fixture.0.display())),
+            &AtomicBool::new(false)
+        )
+        .0
+        .is_empty());
+        assert!(
+            cached_direct_subdirs(&full.summary_index, &parent, &AtomicBool::new(true))
+                .0
+                .is_empty()
+        );
+
+        let mut index = (*full.summary_index).clone();
+        let sample = index
+            .lookup(parent.join("child").to_str().unwrap())
+            .unwrap()
+            .clone();
+        for entry in 0..DISPLAY_CHILDREN + 5 {
+            let mut summary = sample.clone();
+            summary.path = parent
+                .join(format!("cached-{entry}"))
+                .to_str()
+                .unwrap()
+                .to_owned();
+            summary.id = format!("cached-id-{entry}");
+            summary.bytes = entry as u64;
+            index.entries.insert(summary.path.clone(), summary);
+        }
+        let (rows, count) = cached_direct_subdirs(&index, &parent, &AtomicBool::new(false));
+        assert_eq!(count, DISPLAY_CHILDREN as u64 + 6);
+        assert_eq!(rows.len(), DISPLAY_CHILDREN);
+        let mut foreign = sample.clone();
+        foreign.path = parent.join("foreign").to_str().unwrap().to_owned();
+        foreign.device = index.device.wrapping_add(1);
+        index.entries.insert(foreign.path.clone(), foreign);
+        let (_, after) = cached_direct_subdirs(&index, &parent, &AtomicBool::new(false));
+        assert_eq!(after, count);
+    }
+
+    #[test]
+    fn browse_rejects_an_ancestor_symlink_even_when_the_final_directory_identity_matches() {
+        let fixture = Fixture::new();
+        fixture.file("scope/parent/child/keep.bin", 4_096);
+        let scope = fixture.0.join("scope");
+        let full = analyze(&scope, &AtomicBool::new(false), |_| {}).unwrap();
+        let child = &full.root.children[0].children[0];
+        let selected = directory_for_browse(&full, &child.id).unwrap();
+        let identity = selected.filesystem_identity();
+        let outside = fixture.0.join("outside-parent");
+        fs::rename(scope.join("parent"), &outside).unwrap();
+        symlink(&outside, scope.join("parent")).unwrap();
+        let final_metadata = fs::symlink_metadata(&selected.path).unwrap();
+        assert!(!final_metadata.file_type().is_symlink());
+        assert_eq!((final_metadata.dev(), final_metadata.ino()), identity);
+        let error = browse(
+            selected,
+            Arc::clone(&full.summary_index),
+            full.total_bytes,
+            full.available_bytes,
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(error.starts_with("ANALYSIS_NODE_CHANGED:"));
+        assert!(outside.join("child/keep.bin").exists());
+    }
+
+    #[test]
+    fn missing_browse_paths_are_distinguished_from_permission_and_changed_path_errors() {
+        let fixture = Fixture::new();
+        fixture.file("parent/child/keep.bin", 4_096);
+        let full = analyze(&fixture.0, &AtomicBool::new(false), |_| {}).unwrap();
+        let child = &full.root.children[0].children[0];
+        let selected = directory_for_browse(&full, &child.id).unwrap();
+        fs::remove_dir_all(fixture.0.join("parent/child")).unwrap();
+        let error = browse(
+            selected,
+            Arc::clone(&full.summary_index),
+            full.total_bytes,
+            full.available_bytes,
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert_eq!(error, "ANALYSIS_NODE_MISSING:此目录已被移动或删除。");
+        let denied = browse_path_error(io::Error::from_raw_os_error(libc::EACCES));
+        assert!(!denied.starts_with("ANALYSIS_NODE_MISSING:"));
+        assert!(denied.contains("访问权限"));
+        assert!(
+            browse_path_error(io::Error::from_raw_os_error(libc::ENOTDIR))
+                .starts_with("ANALYSIS_NODE_CHANGED:")
+        );
     }
 }

@@ -11,6 +11,8 @@ fn main() {
             "get_disk_overview",
             "choose_analysis_directory",
             "analyze_directory",
+            "browse_analysis_directory",
+            "inspect_analysis_node",
             "cancel_analysis",
             "reveal_analysis_node",
             "open_privacy_settings",

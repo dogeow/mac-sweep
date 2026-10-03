@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod analysis_cache;
+mod analysis_entry;
 mod analyzer;
 mod disk;
 mod finder;
@@ -26,6 +28,7 @@ enum Operation {
     Scanning,
     Cleaning,
     Analyzing,
+    Browsing,
     Choosing,
 }
 
@@ -33,6 +36,23 @@ struct Session {
     operation: Operation,
     snapshot: Option<ScanSnapshot>,
     analyses: VecDeque<analyzer::AnalysisReport>,
+}
+
+impl Session {
+    fn register_analysis(&mut self, report: analyzer::AnalysisReport) {
+        self.analyses.push_front(report);
+        let mut full = 0;
+        let mut browsed = 0;
+        self.analyses.retain(|report| {
+            if report.cached_browse {
+                browsed += 1;
+                browsed <= 128
+            } else {
+                full += 1;
+                full <= 4
+            }
+        });
+    }
 }
 
 struct CleanerState {
@@ -162,8 +182,7 @@ async fn analyze_directory(
     guard.operation = Operation::Idle;
     match result {
         Ok(Ok((report, value))) => {
-            guard.analyses.push_front(report);
-            guard.analyses.truncate(8);
+            guard.register_analysis(report);
             Ok(value)
         }
         Ok(Err(error)) => Err(error),
@@ -172,9 +191,57 @@ async fn analyze_directory(
 }
 
 #[tauri::command]
+async fn browse_analysis_directory(
+    state: State<'_, CleanerState>,
+    analysis_id: String,
+    node_id: String,
+) -> Result<Value, String> {
+    let session = state.session.clone();
+    let cancel = state.cancel.clone();
+    let (node, index, total, available) = {
+        let mut guard = session.lock().map_err(|_| "目录浏览状态不可用")?;
+        if guard.operation != Operation::Idle {
+            return Err("请先等待当前操作完成".into());
+        }
+        let source = guard
+            .analyses
+            .iter()
+            .find(|report| report.analysis_id == analysis_id)
+            .ok_or("此分析结果已过期，请重新打开上一级或重新分析")?;
+        let node = analyzer::directory_for_browse(source, &node_id)?;
+        let selected = (
+            node,
+            Arc::clone(&source.summary_index),
+            source.total_bytes,
+            source.available_bytes,
+        );
+        guard.operation = Operation::Browsing;
+        cancel.store(false, Ordering::Release);
+        selected
+    };
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        analyzer::browse(node, index, total, available, &cancel)
+    })
+    .await;
+    let mut guard = session.lock().map_err(|_| "目录浏览状态不可用")?;
+    guard.operation = Operation::Idle;
+    match result {
+        Ok(Ok(report)) => {
+            // A shallow directory listing is not a disk-capacity refresh. Never
+            // attach the source volume's storage/isVolumeRoot to this folder.
+            let value = serde_json::to_value(&report).map_err(|error| error.to_string())?;
+            guard.register_analysis(report);
+            Ok(value)
+        }
+        Ok(Err(error)) => Err(error),
+        Err(error) => Err(format!("目录打开未完成：{error}")),
+    }
+}
+
+#[tauri::command]
 fn cancel_analysis(state: State<'_, CleanerState>) -> Result<(), String> {
     let guard = state.session.lock().map_err(|_| "分析状态不可用")?;
-    if guard.operation == Operation::Analyzing {
+    if matches!(guard.operation, Operation::Analyzing | Operation::Browsing) {
         state.cancel.store(true, Ordering::Release);
     }
     Ok(())
@@ -190,29 +257,95 @@ fn find_node<'a>(
     node.children.iter().find_map(|child| find_node(child, id))
 }
 
+fn recorded_analysis_entry(
+    session: &Session,
+    analysis_id: &str,
+    node_id: &str,
+) -> Result<(PathBuf, PathBuf, u64, u64), String> {
+    let report = session
+        .analyses
+        .iter()
+        .find(|report| report.analysis_id == analysis_id)
+        .ok_or("此分析结果已过期，请重新分析目录。")?;
+    let node = find_node(&report.root, node_id).ok_or("此项目未包含在分析结果中。")?;
+    if node.path.is_empty() {
+        return Err("此路径不能用 UTF-8 表示，无法从应用定位；大小已经统计。".into());
+    }
+    let (device, inode) = node.filesystem_identity();
+    Ok((
+        PathBuf::from(&node.path),
+        PathBuf::from(&report.summary_index.root),
+        device,
+        inode,
+    ))
+}
+
+#[tauri::command]
+async fn inspect_analysis_node(
+    state: State<'_, CleanerState>,
+    analysis_id: String,
+    node_id: String,
+) -> Result<Value, String> {
+    let (path, root, device, inode) = {
+        let session = state.session.lock().map_err(|_| "分析状态不可用。")?;
+        recorded_analysis_entry(&session, &analysis_id, &node_id)?
+    };
+    let entry_state = tauri::async_runtime::spawn_blocking(move || {
+        analysis_entry::check(&path, &root, device, inode)
+    })
+    .await
+    .map_err(|_| "项目检查未能完成，请稍后重试。")??;
+    Ok(serde_json::json!({"status": match entry_state {
+        analysis_entry::EntryState::Ready => "ready",
+        analysis_entry::EntryState::Missing => "missing",
+        analysis_entry::EntryState::Changed => "changed",
+    }}))
+}
+
 #[tauri::command]
 async fn reveal_analysis_node(
     app: tauri::AppHandle,
     state: State<'_, CleanerState>,
     analysis_id: String,
     node_id: String,
-) -> Result<(), String> {
-    let path = {
+) -> Result<Value, String> {
+    let (path, source_root, device, inode) = {
         let guard = state.session.lock().map_err(|_| "分析状态不可用")?;
-        let report = guard
-            .analyses
-            .iter()
-            .find(|report| report.analysis_id == analysis_id)
-            .ok_or("此分析结果已过期，请重新扫描目录")?;
-        find_node(&report.root, &node_id)
-            .ok_or("此目录未包含在分析结果中")?
-            .path
-            .clone()
+        recorded_analysis_entry(&guard, &analysis_id, &node_id)?
     };
-    if path.is_empty() {
-        return Err("此路径不能用 UTF-8 表示，无法从应用定位；大小已经统计".into());
+    let check_path = path.clone();
+    let check_root = source_root.clone();
+    let entry_state = tauri::async_runtime::spawn_blocking(move || {
+        analysis_entry::check(&check_path, &check_root, device, inode)
+    })
+    .await
+    .map_err(|_| "项目检查未能完成，请稍后重试。")??;
+    match entry_state {
+        analysis_entry::EntryState::Missing => Ok(serde_json::json!({"status":"missing"})),
+        analysis_entry::EntryState::Changed => Ok(serde_json::json!({"status":"changed"})),
+        analysis_entry::EntryState::Ready => match finder::reveal(app, path.clone()).await {
+            Ok(()) => Ok(serde_json::json!({"status":"shown"})),
+            Err(_) => {
+                // A file may disappear between validation and Finder's request.
+                let latest = tauri::async_runtime::spawn_blocking(move || {
+                    analysis_entry::check(&path, &source_root, device, inode)
+                })
+                .await
+                .map_err(|_| "项目检查未能完成，请稍后重试。")??;
+                match latest {
+                    analysis_entry::EntryState::Missing => {
+                        Ok(serde_json::json!({"status":"missing"}))
+                    }
+                    analysis_entry::EntryState::Changed => {
+                        Ok(serde_json::json!({"status":"changed"}))
+                    }
+                    analysis_entry::EntryState::Ready => {
+                        Err("Finder 暂时未能打开这个项目，请稍后重试。".into())
+                    }
+                }
+            }
+        },
     }
-    finder::reveal(app, PathBuf::from(path)).await
 }
 
 #[tauri::command]
@@ -519,6 +652,8 @@ fn main() {
             get_disk_overview,
             choose_analysis_directory,
             analyze_directory,
+            browse_analysis_directory,
+            inspect_analysis_node,
             cancel_analysis,
             reveal_analysis_node,
             open_privacy_settings

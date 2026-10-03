@@ -7,6 +7,7 @@
     "core:event:allow-listen",
     "core:event:allow-unlisten",
     "core:window:allow-start-dragging",
+    "core:window:allow-internal-toggle-maximize",
     "allow-start-scan",
     "allow-cancel-scan",
     "allow-get-last-scan",
@@ -17,6 +18,8 @@
     "allow-get-disk-overview",
     "allow-choose-analysis-directory",
     "allow-analyze-directory",
+    "allow-browse-analysis-directory",
+    "allow-inspect-analysis-node",
     "allow-cancel-analysis",
     "allow-reveal-analysis-node",
     "allow-open-privacy-settings"
