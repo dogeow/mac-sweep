@@ -1,0 +1,31 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Mac Sweep",
+  "version": "0.1.0",
+  "identifier": "com.dogeow.mac-sweep",
+  "build": { "frontendDist": "../frontend" },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [{
+      "label": "main",
+      "title": "Mac Sweep · 磁盘清理",
+      "width": 940,
+      "height": 680,
+      "minWidth": 800,
+      "minHeight": 580,
+      "titleBarStyle": "Overlay",
+      "hiddenTitle": true,
+      "backgroundColor": "#f5f5f5"
+    }],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+      "capabilities": ["main"]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns"],
+    "macOS": { "minimumSystemVersion": "12.0", "infoPlist": "Info.plist", "signingIdentity": "-" }
+  }
+}
