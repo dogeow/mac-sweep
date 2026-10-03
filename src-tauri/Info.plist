@@ -3,5 +3,4 @@
 <plist version="1.0"><dict>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSDownloadsFolderUsageDescription</key><string>Mac Sweep 扫描下载目录中的旧软件安装包，只有你确认选择后才会移到废纸篓。</string>
-  <key>NSAppleEventsUsageDescription</key><string>Mac Sweep 可在 Finder 中打开废纸篓，以便你检查或恢复文件。</string>
 </dict></plist>

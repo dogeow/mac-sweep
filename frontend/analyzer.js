@@ -1,7 +1,8 @@
 (() => {
   'use strict';
   const app = window.macSweep;
-  if (!app) return;
+  const navigation = window.macSweepAnalysisNavigation;
+  if (!app || !navigation) return;
   const $ = (id) => document.getElementById(id);
   const escape = app.escapeHtml;
   const icon = app.icon;
@@ -61,7 +62,11 @@
   function friendlyPath(path) {
     return friendlyName({ path, name: path?.split('/').filter(Boolean).pop() || '文件夹' });
   }
-  const current = () => state.history[state.history.length - 1] || null;
+  const current = () => navigation.current(state.history);
+  function alignBreadcrumbs() {
+    const breadcrumbs = $('analysis-breadcrumbs');
+    breadcrumbs.scrollLeft = breadcrumbs.scrollWidth;
+  }
   const errorText = (error) => typeof error === 'string' ? error : error?.message || '操作未能完成。';
   function closeOptions(restoreFocus = false) {
     $('analysis-options').open = false;
@@ -83,7 +88,7 @@
     if (state.scanning || !path) return;
     state.path = path;
     updateLocations();
-    if (current() && current().node.path !== path) message('info', `已选择${friendlyPath(path)}。点击“查看大小”更新结果。`);
+    if (current() && current().node.path !== path) message('info', `已选择${friendlyPath(path)}。点击“开始分析”更新结果。`);
     else state.message = null;
     render();
   }
@@ -166,6 +171,7 @@
   function render() {
     const entry = current();
     const node = entry?.node;
+    const analysisAction = node?.path === state.path ? '重新分析' : '开始分析';
     const accounting = storageAccounting(node, entry?.report);
     const hasAccountingRows = !!accounting && (accounting.otherVolumes > 0 || accounting.unlocated > 0);
     const busy = app.isBusy();
@@ -185,16 +191,21 @@
     if (app.getView() === 'analysis') {
       $('page-label').textContent = node ? friendlyName(node) : '按大小查看文件夹';
       $('start-scan').disabled = busy || !state.path || !app.desktop || app.demo;
-      $('scan-button-text').textContent = state.scanning ? '正在查看…' : '查看大小';
+      $('scan-button-text').textContent = state.scanning ? '分析中…' : analysisAction;
     }
     $('analysis-location').disabled = busy || !app.desktop || app.demo;
     $('choose-analysis-folder').disabled = busy || !app.desktop || app.demo;
     $('check-cleanup-suggestions').disabled = busy;
-    $('analysis-back').disabled = state.history.length <= 1 || busy;
+    const back = navigation.backAction(state.history, busy || state.scanning);
+    $('analysis-back').disabled = back.disabled;
+    $('analysis-back').setAttribute('aria-label', back.label);
+    $('analysis-back').title = back.label;
     $('analysis-reveal').disabled = !entry || busy || !app.desktop || app.demo;
     $('cancel-analysis').disabled = state.cancelling;
     $('cancel-analysis').textContent = state.cancelling ? '停止中…' : '停止';
     $('analysis-breadcrumbs').innerHTML = state.history.length ? state.history.map((item, index) => `${index ? '<span class="breadcrumb-divider">›</span>' : ''}<button data-history-index="${index}" ${busy || index === state.history.length - 1 ? 'disabled' : ''} title="${escape(state.showDetails ? item.node.path : friendlyName(item.node))}">${escape(friendlyName(item.node))}</button>`).join('') : '<span>空间占用</span>';
+    // Keep the current folder visible when its ancestors exceed the toolbar width.
+    alignBreadcrumbs();
     renderProgress(true);
     renderStorageDetails(accounting);
     const permissionCount = Math.max(0, Number(entry?.report.permissionDeniedCount) || 0);
@@ -205,7 +216,7 @@
     if (!needsAccessReview) $('analysis-permission-help').classList.add('hidden');
     if (!node) {
       $('analysis-empty').classList.remove('hidden');
-      if (!state.scanning) $('analysis-empty').innerHTML = '<strong>查看文件夹占用</strong><p>选择位置后，点击“查看大小”。</p>';
+      if (!state.scanning) $('analysis-empty').innerHTML = '<strong>查看文件夹占用</strong><p>选择位置后，点击“开始分析”。</p>';
       $('analysis-rows').innerHTML = '';
       $('analysis-status').textContent = '只查看占用，不会修改文件';
       $('analysis-table-footer').classList.remove('has-pages');
@@ -233,7 +244,7 @@
     $('analysis-empty').classList.toggle('hidden', children.length > 0 || node.omittedChildren > 0 || hasAccountingRows);
     if (!children.length && !node.omittedChildren && !hasAccountingRows) {
       const empty = node.kind === 'directory' && !node.hasChildren && !node.files;
-      $('analysis-empty').innerHTML = `<strong>${node.partial ? '部分内容未能读取' : node.hasChildren ? '继续查看这个文件夹' : empty ? '这个文件夹为空' : '没有可展示的子项'}</strong><p>${node.partial ? '打开上方提示查看原因，再重新查看。' : node.hasChildren ? '点击“查看大小”，读取里面的文件与文件夹。' : '可以选择其他位置查看。'}</p>`;
+      $('analysis-empty').innerHTML = `<strong>${node.partial ? '部分内容未能读取' : node.hasChildren ? '继续查看这个文件夹' : empty ? '这个文件夹为空' : '没有可展示的子项'}</strong><p>${node.partial ? '打开上方提示查看原因，再重新分析。' : node.hasChildren ? `点击“${analysisAction}”，读取里面的文件与文件夹。` : '可以选择其他位置查看。'}</p>`;
     }
     const first = children.length ? (state.page - 1) * PAGE_SIZE + 1 : 0;
     $('analysis-table-footer').classList.toggle('has-pages', pages > 1);
@@ -264,6 +275,7 @@
   }
   async function scanDirectory(path = state.path, append = false, parentHistory = state.history) {
     if (!app.desktop || app.demo || app.isBusy() || !path) return;
+    const parents = navigation.parentsForScan(state.history, path, append, parentHistory);
     const revision = ++state.revision;
     state.scanning = true;
     state.cancelling = false;
@@ -277,8 +289,8 @@
       const report = await invoke('analyze_directory', { path });
       if (revision !== state.revision) return;
       if (!validReport(report)) throw new Error('目录分析结果格式无效。');
-      const entry = { node: report.root, report };
-      state.history = append ? [...parentHistory, entry] : [entry];
+      const entry = { node: report.root, report, page: 1 };
+      state.history = navigation.commitScan(parents, entry);
       state.path = report.root.path;
       state.page = 1;
       updateLocations();
@@ -303,12 +315,6 @@
     while (queue.length) { const node = queue.pop(); if (node.id === id) return node; queue.push(...(node.children || [])); }
     return null;
   }
-  function findNodePath(root, id) {
-    if (!root) return null;
-    if (root.id === id) return [root];
-    for (const child of root.children || []) { const path = findNodePath(child, id); if (path) return [root, ...path]; }
-    return null;
-  }
   async function reveal(node = current()?.node) {
     const entry = current();
     if (!node || !entry || !app.desktop || app.demo || app.isBusy()) return;
@@ -317,25 +323,33 @@
     catch (error) { message('error', `无法在 Finder 中显示：${errorText(error)}`); }
   }
   function drill(node) {
-    if (!node || app.isBusy()) return;
+    if (!node || state.scanning || app.isBusy()) return;
     if (!node.path) { message('info', '此文件名无法用 UTF-8 表示，已统计占用，但不能从应用继续打开。'); return; }
     if (node.kind !== 'directory') { reveal(node); return; }
     const entry = current();
-    const path = findNodePath(entry.node, node.id) || [entry.node, node];
-    const intermediate = path.slice(1, -1).map((parent) => ({ node: parent, report: entry.report }));
-    if (node.hasChildren && !(node.children || []).length) { scanDirectory(node.path, true, [...state.history, ...intermediate]); return; }
-    state.history.push(...intermediate, { node, report: entry.report });
+    if (entry) entry.page = state.page;
+    const plan = navigation.drillPlan(state.history, node);
+    if (!plan) return;
+    if (plan.needsScan) { scanDirectory(plan.path, true, plan.parents); return; }
+    state.history = plan.history;
     state.path = node.path;
     state.page = 1;
     state.message = null;
     updateLocations();
     render();
   }
-  function goBack(index = state.history.length - 2) {
-    if (app.isBusy() || index < 0 || index >= state.history.length) return;
-    state.history = state.history.slice(0, index + 1);
+  function goBack(index) {
+    if (state.scanning || app.isBusy()) return;
+    if (index === undefined) {
+      const back = navigation.backAction(state.history);
+      if (back.kind === 'home') { app.showHome(); return; }
+      index = back.index;
+    }
+    const history = navigation.returnTo(state.history, index);
+    if (history === state.history) return;
+    state.history = history;
     state.path = current().node.path;
-    state.page = 1;
+    state.page = current().page || 1;
     state.message = null;
     updateLocations();
     render();
@@ -379,6 +393,7 @@
     document.addEventListener('click', (event) => { if (!event.target.closest('#analysis-options, [data-analysis-accounting], #analysis-permissions')) closeOptions(); });
     document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && $('analysis-options').open) closeOptions(true); });
     window.addEventListener('mac-sweep-view', () => render());
+    window.addEventListener('resize', alignBreadcrumbs);
   }
   async function init() {
     bind();

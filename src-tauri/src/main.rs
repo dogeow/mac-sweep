@@ -2,6 +2,7 @@
 
 mod analyzer;
 mod disk;
+mod finder;
 mod scanner;
 
 use scanner::{ScanOptions, ScanSnapshot};
@@ -190,7 +191,8 @@ fn find_node<'a>(
 }
 
 #[tauri::command]
-fn reveal_analysis_node(
+async fn reveal_analysis_node(
+    app: tauri::AppHandle,
     state: State<'_, CleanerState>,
     analysis_id: String,
     node_id: String,
@@ -210,16 +212,7 @@ fn reveal_analysis_node(
     if path.is_empty() {
         return Err("此路径不能用 UTF-8 表示，无法从应用定位；大小已经统计".into());
     }
-    let status = Command::new("/usr/bin/open")
-        .arg("-R")
-        .arg(path)
-        .status()
-        .map_err(|e| e.to_string())?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("无法在 Finder 中显示项目".into())
-    }
+    finder::reveal(app, PathBuf::from(path)).await
 }
 
 #[tauri::command]
@@ -331,7 +324,8 @@ async fn clean_items(
 }
 
 #[tauri::command]
-fn reveal_item(
+async fn reveal_item(
+    app: tauri::AppHandle,
     state: State<'_, CleanerState>,
     scan_id: String,
     item_id: String,
@@ -351,32 +345,12 @@ fn reveal_item(
             .path
             .clone()
     };
-    let status = Command::new("/usr/bin/open")
-        .arg("-R")
-        .arg(path)
-        .status()
-        .map_err(|e| e.to_string())?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("无法在 Finder 中显示项目".into())
-    }
+    finder::reveal(app, PathBuf::from(path)).await
 }
 
 #[tauri::command]
-fn open_trash() -> Result<(), String> {
-    let output = Command::new("/usr/bin/osascript")
-        .args(["-e", "tell application \"Finder\" to open trash"])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "无法打开废纸篓：{}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
+async fn open_trash(app: tauri::AppHandle, state: State<'_, CleanerState>) -> Result<(), String> {
+    finder::open_trash(app, state.home.clone()).await
 }
 
 fn is_cleaning(app: &tauri::AppHandle) -> bool {

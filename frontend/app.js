@@ -182,6 +182,8 @@
     });
     $('toggle-settings').classList.toggle('hidden', state.view !== 'cleanup');
     $('start-scan').classList.toggle('hidden', state.view === 'home');
+    $('start-scan').classList.toggle('primary', state.view === 'analysis');
+    $('start-scan').classList.toggle('secondary', state.view !== 'analysis');
     $('home-view').classList.toggle('hidden', state.view !== 'home');
     $('analysis-view').classList.toggle('hidden', state.view !== 'analysis');
     $('analysis-statusbar').classList.toggle('hidden', state.view !== 'analysis');
@@ -230,8 +232,10 @@
     $('selection-description').textContent = selected.length ? (reviewCount ? `包含 ${reviewCount} 项需要你确认的内容` : '移到废纸篓前，会再次让你确认。') : '移到废纸篓前，会再次让你确认。';
     $('review-cleanup').disabled = busy || selected.length === 0 || !desktop || demo;
     $('review-cleanup').title = demo ? '演示模式禁止清理' : !desktop ? '请在桌面应用中使用' : '';
-    $('start-scan').disabled = busy || !desktop || demo;
-    $('scan-button-text').textContent = state.analysisBusy ? '查看中…' : state.scanning ? '检查中…' : state.report ? '重新检查' : '开始检查';
+    if (state.view !== 'analysis') {
+      $('start-scan').disabled = busy || !desktop || demo;
+      $('scan-button-text').textContent = state.scanning ? '检查中…' : state.report ? '重新检查' : '开始检查';
+    }
     $('app-status').textContent = demo ? '演示模式' : state.cleaning ? '正在清理' : state.analysisBusy ? '正在查看文件夹大小' : state.scanning ? '正在检查' : desktop ? '准备就绪' : '请打开桌面应用';
     document.querySelector('.status-dot').classList.toggle('busy', busy);
     $('open-trash').disabled = !desktop || demo;

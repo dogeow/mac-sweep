@@ -45,7 +45,7 @@ input:disabled { cursor: default; opacity: .45; }
 .status-dot { width: 6px; height: 6px; background: var(--good); border-radius: 50%; flex-shrink: 0; }
 .status-dot.busy { background: var(--accent); animation: pulse 1s ease-in-out infinite; }
 .workspace { height: 100%; margin-left: var(--sidebar-width); display: flex; flex-direction: column; background: var(--bg); }
-.toolbar { height: 56px; min-height: 56px; display: flex; align-items: center; justify-content: space-between; gap: 15px; background: var(--toolbar); border-bottom: 1px solid var(--border); padding: 0 17px 0 22px; user-select: none; flex-shrink: 0; }
+.toolbar { height: 64px; min-height: 64px; display: flex; align-items: center; justify-content: space-between; gap: 15px; background: var(--toolbar); border-bottom: 1px solid var(--border); padding: 0 17px 0 22px; user-select: none; flex-shrink: 0; }
 .toolbar-title { display: flex; flex-direction: column; justify-content: center; gap: 4px; flex: 1; min-width: 0; }
 .toolbar-title h1 { font-size: 14px; font-weight: 600; line-height: 1.2; margin: 0; color: var(--text); }
 .toolbar-title > span { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -54,6 +54,8 @@ input:disabled { cursor: default; opacity: .45; }
 .toolbar-button:hover:not(:disabled), .toolbar-button[aria-expanded=true] { background: var(--button); border-color: var(--border); }
 .button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; border-radius: 6px; min-height: 29px; padding: 5px 12px; font-size: 12px; font-weight: 400; white-space: nowrap; box-shadow: 0 1px 2px #00000008; }
 .button svg { width: 14px; height: 14px; }
+.scan-button { min-height: 40px; min-width: 116px; padding: 9px 16px; gap: 8px; border-radius: 8px; font-size: 13px; font-weight: 500; }
+.scan-button svg { width: 16px; height: 16px; }
 .primary { background: var(--accent); border: 1px solid #006ee6; color: #fff; }
 .primary:hover:not(:disabled) { background: var(--accent-hover); }
 .secondary { background: var(--button); border: 1px solid var(--border); color: var(--text); }
@@ -256,15 +258,29 @@ dialog::backdrop { background: #00000028; }
 .cleanup-bar > span { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; }
 .dialog-progress p { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin: 8px 0 0; }
 .analysis-view { display: flex; flex: 1; min-height: 0; flex-direction: column; overflow: hidden; }
-.analysis-browser-header { display: flex; align-items: center; gap: 7px; min-height: 46px; padding: 8px 13px; border-bottom: 1px solid var(--hairline); flex-shrink: 0; background: var(--bg); }
-.analysis-browser-header > .toolbar-button { width: 28px; height: 29px; flex-shrink: 0; }
-#analysis-back { font-size: 24px; line-height: 1; padding: 0; font-family: Arial, sans-serif; }
+.analysis-browser-header { display: flex; align-items: center; gap: 10px; min-height: 62px; padding: 10px 18px; border-bottom: 1px solid var(--hairline); flex-shrink: 0; background: var(--bg); }
+.analysis-browser-header > .toolbar-button { width: 40px; height: 40px; flex-shrink: 0; border-radius: 7px; }
+.analysis-browser-header > .toolbar-button:not(.analysis-back-button) { background: var(--button); border-color: var(--border); }
+.analysis-browser-header > .analysis-back-button { display: inline-flex; justify-content: center; align-items: center; gap: 4px; width: auto; min-width: 70px; padding: 0 9px; font-size: 12px; color: var(--secondary); }
+.analysis-back-button svg { width: 14px; height: 14px; }
+#choose-analysis-folder { display: inline-flex; align-items: center; justify-content: center; gap: 6px; width: auto; padding: 0 10px; font-size: 12px; white-space: nowrap; }
 .analysis-browser-header nav { display: flex; align-items: center; gap: 2px; flex: 1; min-width: 0; overflow: auto; white-space: nowrap; font-size: 12px; color: var(--muted); scrollbar-width: none; }
 .analysis-browser-header nav::-webkit-scrollbar { display: none; }
-.analysis-browser-header nav button { color: var(--secondary); background: transparent; font-size: 12px; padding: 5px 4px; border-radius: 4px; max-width: 160px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex-shrink: 0; }
+.analysis-browser-header nav button { color: var(--secondary); background: transparent; font-size: 12px; padding: 6px 4px; border-radius: 4px; max-width: min(160px, 100%); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex-shrink: 0; }
 .analysis-browser-header nav button:disabled { opacity: 1; color: var(--text); font-weight: 500; }
 .analysis-browser-header nav button:hover:not(:disabled) { background: var(--row-alt); }
-.analysis-browser-header > select { max-width: 158px; font-size: 11px; min-height: 27px; flex-shrink: 0; }
+.analysis-location-control { display: flex; align-items: center; gap: 9px; flex-shrink: 0; }
+.analysis-location-control > label { color: var(--secondary); font-size: 12px; white-space: nowrap; }
+.analysis-location-select { position: relative; width: 204px; height: 40px; }
+.analysis-location-select select { appearance: none; width: 100%; height: 100%; min-height: 40px; padding: 8px 32px 8px 37px; background: var(--button); border: 1px solid var(--border); border-radius: 8px; color: var(--text); font-size: 13px; font-weight: 500; text-overflow: ellipsis; }
+.analysis-location-select select:hover:not(:disabled) { border-color: var(--muted); }
+.analysis-location-select select:disabled { color: var(--muted); cursor: default; }
+.analysis-location-select > span { position: absolute; top: 0; bottom: 0; display: flex; align-items: center; justify-content: center; pointer-events: none; color: var(--muted); }
+.location-icon { left: 11px; }
+.location-icon svg { width: 16px; height: 16px; }
+.location-chevron { right: 11px; }
+.location-chevron svg { width: 12px; height: 12px; }
+.analysis-browser-header .analysis-options > summary { min-height: 40px; padding: 8px; font-size: 12px; }
 .analysis-options { position: relative; flex-shrink: 0; color: var(--secondary); }
 .analysis-options-menu { position: absolute; top: calc(100% + 7px); right: 0; z-index: 60; width: 224px; padding: 11px; background: var(--toolbar); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 7px 22px #00000022; }
 .analysis-options-menu label { display: flex; justify-content: space-between; align-items: center; gap: 9px; font-size: 11px; padding: 3px 3px 10px; margin-bottom: 5px; border-bottom: 1px solid var(--hairline); color: var(--muted); }
@@ -396,7 +412,10 @@ th { height: 28px; text-align: left; font-size: 11px; font-weight: 400; color: v
   .progress-stats { display: none; }
   .selection-info > span { max-width: 280px; }
   .selection-actions { gap: 12px; }
-  .analysis-browser-header > select { max-width: 140px; }
+  .analysis-browser-header { gap: 8px; padding-left: 14px; padding-right: 14px; }
+  .analysis-location-select { width: 182px; }
+  .analysis-location-control { gap: 7px; }
+  .analysis-browser-header > .analysis-back-button { min-width: 64px; padding: 0 7px; }
   .analysis-chart-pane { width: 41%; min-width: 224px; padding: 11px 10px; }
   .chart-center strong { font-size: 19px; }
   .analysis-table th { font-size: 10px; padding-left: 7px; padding-right: 7px; }
