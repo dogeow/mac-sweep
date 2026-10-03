@@ -35,7 +35,9 @@
   const demo = new URLSearchParams(window.location.search).get('demo') === '1';
   const invoke = (name, args) => window.__TAURI__.core.invoke(name, args);
   const PAGE_SIZE = 100;
-  const state = { view: 'home', analysisBusy: false, report: null, diskOverview: null, diskUnavailable: false, selected: new Set(), moved: new Set(), failures: new Map(), receipts: [], groups: new Map(), expanded: new Set(), filter: 'all', search: '', risk: 'all', sort: 'size-desc', page: 1, scanning: false, cancelling: false, cleaning: false, scanRevision: 0, dialogSelection: null, previousFocus: null, message: null, extraWarnings: [] };
+  const GROUP_PAGE_SIZE = 30;
+  const cleanupModel = window.MacSweepCleanup;
+  const state = { view: 'home', analysisBusy: false, report: null, diskOverview: null, diskUnavailable: false, selected: new Set(), moved: new Set(), failures: new Map(), receipts: [], groups: new Map(), expanded: new Set(), detailPages: new Map(), filter: 'all', search: '', risk: 'all', sort: 'size-desc', page: 1, scanning: false, cancelling: false, cleaning: false, scanRevision: 0, dialogSelection: null, previousFocus: null, message: null, extraWarnings: [] };
   const bytes = (value) => {
     const number = Number(value) || 0;
     if (number === 0) return '0 B';
@@ -58,14 +60,15 @@
     });
   };
   const errorText = (error) => typeof error === 'string' ? error : error?.message || '操作未能完成，请重试。';
-  const currentPageItems = () => visibleItems().slice((state.page - 1) * PAGE_SIZE, state.page * PAGE_SIZE);
+  const currentPageGroups = () => cleanupModel.pageItems(cleanupModel.groupItems(visibleItems(), state.sort), state.page, GROUP_PAGE_SIZE).items;
+  const currentPageItems = () => currentPageGroups().flatMap((group) => group.items);
   function setMessage(type, title, detail = '', canOpenTrash = false) {
     state.message = { type, title, detail, canOpenTrash, context: state.view === 'analysis' ? 'analysis' : 'cleanup' };
     renderMessage();
   }
   function renderMessage() {
     const panel = $('message-panel');
-    const visible = state.message && state.message.context === (state.view === 'analysis' ? 'analysis' : 'cleanup');
+    const visible = state.message && !(state.message.type === 'success' && !state.message.canOpenTrash && state.report) && state.message.context === (state.view === 'analysis' ? 'analysis' : 'cleanup');
     panel.classList.toggle('hidden', !visible);
     if (!visible) return;
     const message = state.message;
@@ -76,10 +79,11 @@
     const warnings = [...(state.report?.warnings || []), ...state.extraWarnings];
     const panel = $('warning-panel');
     panel.classList.toggle('hidden', warnings.length === 0 && !state.report?.cancelled);
-    $('warning-title').textContent = state.report?.cancelled ? '检查已停止，以下是部分结果' : '检查过程中有提示';
+    const incomplete = state.report?.cancelled || (state.report?.warnings || []).some((warning) => /部分结果|上限|无法.*读取|占用未知|已跳过|不完整|已停用/.test(warning));
+    $('warning-title').textContent = state.report?.cancelled ? '已停止 · 部分结果' : `${incomplete ? '部分结果 · ' : ''}${warnings.length} 条提醒`;
     $('warning-summary').textContent = state.report?.cancelled ? '没有检查完所有位置；已发现的内容可以继续查看。' : `${warnings.length} 条提示，可点开查看。无法读取的内容不会被清理。`;
     $('warning-list').innerHTML = warnings.map((warning) => `<li>${escape(warning)}</li>`).join('');
-    panel.querySelector('details').classList.toggle('hidden', warnings.length === 0);
+
   }
   function renderReceipts() {
     $('receipt-panel').classList.toggle('hidden', state.receipts.length === 0);
@@ -140,60 +144,38 @@
       $('home-result-detail').textContent += ' 检查过程中有提示，查看检查结果了解详情。';
     }
   }
-  function groupName(item) {
-    if (item.appName) return item.appName;
-    return { cache: '其他应用缓存', logs: '其他旧日志', installer: '下载的安装包', orphan: '未识别的应用数据' }[item.category] || '其他文件';
-  }
-  function renderGroups(pageItems, busy, paginated) {
-    state.groups.clear();
-    pageItems.forEach((item) => {
-      const suggested = item.selectedByDefault === true;
-      const name = groupName(item);
-      const key = JSON.stringify([item.category, suggested, name]);
-      if (!state.groups.has(key)) state.groups.set(key, { key, name, category: item.category, suggested, items: [] });
-      state.groups.get(key).items.push(item);
-    });
-    const allGroups = [...state.groups.values()];
-    let html = '';
-    [true, false].forEach((suggested) => {
-      const groups = allGroups.filter((group) => group.suggested === suggested);
-      if (!groups.length) return;
-      html += `<section class="suggestion-section"><div class="suggestion-section-heading"><h3>${suggested ? '建议检查' : '需要你确认'}</h3><p>${suggested ? '先看看这些旧内容是否还需要。' : '安装包和应用数据默认不选中，查看后再决定。'}</p></div>`;
-      categories.forEach((category) => {
-        const categoryGroups = groups.filter((group) => group.category === category);
-        if (!categoryGroups.length) return;
-        html += `<div class="cleanup-category"><h4>${escape(labels[category])}</h4><p>${escape(explanations[category])}</p></div>`;
-        categoryGroups.forEach((group) => {
-          const selected = group.items.filter((item) => state.selected.has(item.id));
-          const failures = group.items.filter((item) => state.failures.has(item.id));
-          const open = state.expanded.has(group.key);
-          const groupCount = `${paginated ? '本页 ' : ''}${group.items.length} 项`;
-          const warning = failures.length ? `<p class="group-error">${failures.length} 项未能移动，仍保留在列表中。请查看原因，并在 Finder 检查文件位置。</p>` : '';
-          html += `<article class="cleanup-group${selected.length ? ' selected' : ''}${failures.length ? ' failed' : ''}"><div class="group-row"><input type="checkbox" data-group-id="${escape(group.key)}" ${selected.length === group.items.length ? 'checked' : ''} ${busy || (!suggested && !open) ? 'disabled' : ''} aria-label="选择${paginated ? '本页' : ''} ${escape(group.name)} 的 ${group.items.length} 个项目" /><span class="group-icon ${category}">${icon(categoryIcons[category])}</span><div class="group-name"><strong>${escape(group.name)}</strong><span>${escape(groupCount)}${selected.length ? ` · 已选 ${selected.length} 项` : !suggested ? ' · 查看后选择' : ''}</span></div><strong class="group-size">${bytes(sum(group.items))}</strong></div>${warning}<details class="group-details" data-group-details="${escape(group.key)}" ${open ? 'open' : ''}><summary>查看文件${!suggested && !open ? '并选择' : '详情'}</summary><div class="group-files">${group.items.map((item) => {
-            const failure = state.failures.get(item.id);
-            return `<div class="detail-file${failure ? ' failed' : ''}"><div class="detail-file-heading"><input type="checkbox" data-item-id="${escape(item.id)}" ${state.selected.has(item.id) ? 'checked' : ''} ${busy ? 'disabled' : ''} aria-label="选择 ${escape(item.name)}" /><strong title="${escape(item.name)}">${escape(item.name)}</strong><span>${bytes(item.bytes)}</span><button class="row-reveal" data-reveal-id="${escape(item.id)}" title="在 Finder 中显示" aria-label="在 Finder 中显示 ${escape(item.name)}" ${!desktop || demo || busy ? 'disabled' : ''}>${icon('folder')}</button></div><p class="detail-file-reason">${escape(item.reason)}</p><code class="detail-file-path">${escape(item.path)}</code><p class="detail-file-meta">修改于 ${date(item.modifiedAt)} · ${Number(item.files || 0).toLocaleString()} 个文件 · ${item.risk === 'low' ? '建议检查' : '需要你确认'}</p>${failure ? `<p class="row-error">未能移动：${escape(failure)}</p>` : ''}</div>`;
-          }).join('')}</div></details></article>`;
-        });
-      });
-      html += '</section>';
-    });
-    $('result-rows').innerHTML = html;
+  function renderGroups(groups, busy, filtered) {
+    $('result-rows').innerHTML = groups.map((group) => {
+      const selected = cleanupModel.selectedState(group, state.selected);
+      const failures = group.items.filter((item) => state.failures.has(item.id));
+      const open = state.expanded.has(group.key);
+      const detailsPage = cleanupModel.pageItems(group.items, state.detailPages.get(group.key) || 1, PAGE_SIZE);
+      state.detailPages.set(group.key, detailsPage.page);
+      const count = `${filtered ? '当前筛选 · ' : ''}${group.items.length.toLocaleString()} 项`;
+      const files = open ? `<div class="group-files"><p class="detail-file-reason">${escape(explanations[group.category] || '')}</p>${detailsPage.items.map((item) => {
+        const failure = state.failures.get(item.id);
+        return `<div class="detail-file${failure ? ' failed' : ''}"><div class="detail-file-heading"><input type="checkbox" data-item-id="${escape(item.id)}" ${state.selected.has(item.id) ? 'checked' : ''} ${busy ? 'disabled' : ''} aria-label="选择 ${escape(item.name)}" /><strong title="${escape(item.name)}">${escape(item.name)}</strong><span>${bytes(item.bytes)}</span><button class="row-reveal" data-reveal-id="${escape(item.id)}" title="在 Finder 中显示" aria-label="在 Finder 中显示 ${escape(item.name)}" ${!desktop || demo || busy ? 'disabled' : ''}>${icon('folder')}</button></div><p class="detail-file-reason">${escape(item.reason)}</p><code class="detail-file-path">${escape(item.path)}</code><p class="detail-file-meta">修改于 ${date(item.modifiedAt)} · ${Number(item.files || 0).toLocaleString()} 个文件</p>${failure ? `<p class="row-error">未能移动：${escape(failure)}</p>` : ''}</div>`;
+      }).join('')}</div>${detailsPage.pages > 1 ? `<div class="group-file-pagination"><span>文件 ${detailsPage.first}–${detailsPage.last} / ${group.items.length}</span><button class="page-button" data-detail-page="previous" data-detail-key="${escape(group.key)}" ${busy || detailsPage.page <= 1 ? 'disabled' : ''}>上一页</button><span>${detailsPage.page} / ${detailsPage.pages}</span><button class="page-button" data-detail-page="next" data-detail-key="${escape(group.key)}" ${busy || detailsPage.page >= detailsPage.pages ? 'disabled' : ''}>下一页</button></div>` : ''}` : '';
+      return `<article class="cleanup-group${selected.count ? ' selected' : ''}${failures.length ? ' failed' : ''}"><div class="group-row"><input type="checkbox" data-group-id="${escape(group.key)}" ${selected.checked ? 'checked' : ''} ${busy || (!group.suggested && !open) ? 'disabled' : ''} aria-label="选择 ${escape(group.name)} 的全部 ${group.items.length} 个匹配项目" /><span class="group-icon ${escape(group.category)}">${icon(categoryIcons[group.category])}</span><div class="group-name"><strong>${escape(group.name)}</strong><span>${escape(labels[group.category] || group.category)} · ${count}</span></div>${!group.suggested ? '<span class="group-badge review">需确认</span>' : ''}<strong class="group-size">${bytes(group.bytes)}</strong></div>${failures.length ? `<p class="group-error">${failures.length} 项未能移动，展开查看原因</p>` : ''}<details class="group-details" data-group-details="${escape(group.key)}" ${open ? 'open' : ''}><summary title="${open ? '收起' : '查看'} ${escape(group.name)} 的文件详情" aria-label="${open ? '收起' : '查看'} ${escape(group.name)} 的文件详情"><span class="sr-only">查看文件详情</span><span class="group-chevron">${icon('chevron-down')}</span></summary>${files}</details></article>`;
+    }).join('');
     $('result-rows').querySelectorAll('[data-group-id]').forEach((checkbox) => {
-      const group = state.groups.get(checkbox.dataset.groupId);
-      checkbox.indeterminate = !checkbox.checked && group.items.some((item) => state.selected.has(item.id));
+      checkbox.indeterminate = cleanupModel.selectedState(state.groups.get(checkbox.dataset.groupId), state.selected).indeterminate;
     });
   }
   function render() {
     const items = activeItems();
     const selected = selectedItems();
     const visible = visibleItems();
-    const pages = Math.max(1, Math.ceil(visible.length / PAGE_SIZE));
-    state.page = Math.min(Math.max(1, state.page), pages);
-    const pageItems = visible.slice((state.page - 1) * PAGE_SIZE, state.page * PAGE_SIZE);
+    const allGroups = cleanupModel.groupItems(visible, state.sort);
+    state.groups = new Map(allGroups.map((group) => [group.key, group]));
+    const groupPage = cleanupModel.pageItems(allGroups, state.page, GROUP_PAGE_SIZE);
+    state.page = groupPage.page;
+    const pages = groupPage.pages;
+    const pageItems = groupPage.items.flatMap((group) => group.items);
     const busy = state.scanning || state.cleaning || state.analysisBusy;
     const titles = { home: '我的 Mac', cleanup: '建议清理', analysis: '空间去哪里了' };
     $('main-title').textContent = titles[state.view];
-    if (state.view !== 'analysis') $('page-label').textContent = state.view === 'home' ? '先检查，再由你决定清理什么' : '选好内容后，移到废纸篓';
+    if (state.view !== 'analysis') $('page-label').textContent = state.view === 'home' ? '先检查，再由你决定清理什么' : '';
     ['home', 'cleanup', 'analysis'].forEach((view) => {
       $(`show-${view}`).classList.toggle('active', state.view === view);
       $(`show-${view}`).disabled = state.cleaning || (view !== state.view && (state.scanning || state.analysisBusy));
@@ -216,7 +198,7 @@
     }
     $('candidate-total').textContent = state.report ? bytes(sum(items)) : '—';
     $('selected-total').textContent = bytes(sum(selected));
-    $('scan-summary-title').textContent = state.report ? (state.report.cancelled ? '检查提前停止，这是部分结果' : `检查完成 · ${date(state.report.startedAt)}`) : '先开始一次检查';
+    $('scan-summary-title').textContent = state.report ? `${allGroups.length} 组内容${state.report.cancelled ? ' · 检查已停止' : ''}` : '先开始一次检查';
     $('scan-summary-detail').textContent = state.report ? '只展示符合检查条件的内容' : '检查不会更改文件';
     $('result-count').textContent = state.report ? `· ${bytes(sum(visible))}` : '';
     $('results-subtitle').textContent = state.report ? '先看说明，再选择不需要的内容。' : '检查完成后，会按应用和用途整理建议。';
@@ -234,16 +216,16 @@
     }
     $('empty-scan').classList.toggle('hidden', Boolean(state.report) || state.scanning);
     $('empty-scan').disabled = busy || !desktop || demo;
-    renderGroups(pageItems, busy, pages > 1);
+    renderGroups(groupPage.items, busy, Boolean(state.search || state.filter !== 'all' || state.risk !== 'all'));
     const all = $('select-all');
     const pageSuggested = pageItems.filter((item) => item.selectedByDefault === true);
     all.checked = pageSuggested.length > 0 && pageSuggested.every((item) => state.selected.has(item.id));
     all.indeterminate = !all.checked && pageSuggested.some((item) => state.selected.has(item.id));
     all.disabled = busy || pageSuggested.length === 0;
-    all.setAttribute('aria-label', `选择本页 ${pageSuggested.length} 个建议项`);
+    all.setAttribute('aria-label', `选择当前列表中的 ${pageSuggested.length} 个建议项`);
     $('select-safe').disabled = busy || !items.some((item) => item.selectedByDefault === true);
     $('clear-selection').disabled = busy || selected.length === 0;
-    $('selection-count').textContent = selected.length ? `已选 ${bytes(sum(selected))} · ${selected.length} 项` : '选择你想整理的内容';
+    $('selection-count').textContent = selected.length ? `已选 ${bytes(sum(selected))}` : '请选择要清理的内容';
     const reviewCount = selected.filter((item) => item.risk !== 'low').length;
     $('selection-description').textContent = selected.length ? (reviewCount ? `包含 ${reviewCount} 项需要你确认的内容` : '移到废纸篓前，会再次让你确认。') : '移到废纸篓前，会再次让你确认。';
     $('review-cleanup').disabled = busy || selected.length === 0 || !desktop || demo;
@@ -256,9 +238,11 @@
     $('cancel-scan').disabled = state.cancelling;
     $('cancel-scan').textContent = state.cancelling ? '正在停止…' : '停止';
     $('progress-panel').classList.toggle('hidden', !state.scanning);
-    const range = visible.length ? `${(state.page - 1) * PAGE_SIZE + 1}–${Math.min(state.page * PAGE_SIZE, visible.length)}` : '0';
-    $('results-footer-detail').textContent = state.report ? `显示 ${range} / ${visible.length} 项${pages > 1 ? ' · 勾选本页内容' : ''}${state.moved.size ? ` · 已移动 ${state.moved.size} 项` : ''}` : '不会自动移动或删除文件';
+    const range = allGroups.length ? `${groupPage.first}–${groupPage.last}` : '0';
+    $('results-footer-detail').textContent = pages > 1 ? `分组 ${range} / ${allGroups.length}` : '';
     $('pagination').classList.toggle('hidden', pages <= 1);
+    $('cleanup-group-pages').classList.toggle('hidden', pages <= 1);
+    $('cleanup-view').classList.toggle('has-group-pages', pages > 1);
     $('page-label-counter').textContent = `${state.page} / ${pages}`;
     $('previous-page').disabled = state.page <= 1;
     $('next-page').disabled = state.page >= pages;
@@ -276,6 +260,7 @@
     state.moved.clear();
     state.failures.clear();
     state.expanded.clear();
+    state.detailPages.clear();
     state.page = 1;
   }
   async function scan() {
@@ -436,13 +421,21 @@
     document.querySelector('.brand').addEventListener('click', (event) => { event.preventDefault(); setView('home'); });
     document.querySelectorAll('[data-category]').forEach((button) => button.addEventListener('click', () => { if (!setView('cleanup')) return; state.filter = button.dataset.category; state.page = 1; render(); }));
     $('toggle-settings').addEventListener('click', () => { const open = $('scan-settings').classList.toggle('hidden') === false; $('toggle-settings').setAttribute('aria-expanded', String(open)); });
+    document.addEventListener('pointerdown', (event) => {
+      ['advanced-filters', 'warning-panel'].forEach((id) => { const panel = $(id); if (panel.open && !panel.contains(event.target)) panel.open = false; });
+    });
+    document.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape' || $('cleanup-dialog').open) return;
+      const panel = ['advanced-filters', 'warning-panel'].map($).find((element) => element.open);
+      if (panel) { event.preventDefault(); panel.open = false; panel.querySelector('summary')?.focus(); }
+    });
     document.addEventListener('pointerdown', (event) => { if (!$('scan-settings').classList.contains('hidden') && !$('scan-settings').contains(event.target) && !$('toggle-settings').contains(event.target)) closeSettings(); });
     document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && !$('scan-settings').classList.contains('hidden')) { event.preventDefault(); closeSettings(); $('toggle-settings').focus(); } });
     $('search').addEventListener('input', (event) => { state.search = event.target.value; state.page = 1; render(); });
     $('risk-filter').addEventListener('change', (event) => { state.risk = event.target.value; state.page = 1; render(); });
     $('sort').addEventListener('change', (event) => { state.sort = event.target.value; state.page = 1; render(); });
     $('previous-page').addEventListener('click', () => { if (state.page <= 1) return; state.page -= 1; render(); $('result-table').scrollIntoView({ block: 'start' }); });
-    $('next-page').addEventListener('click', () => { if (state.page >= Math.ceil(visibleItems().length / PAGE_SIZE)) return; state.page += 1; render(); $('result-table').scrollIntoView({ block: 'start' }); });
+    $('next-page').addEventListener('click', () => { if (state.page >= Math.ceil(cleanupModel.groupItems(visibleItems(), state.sort).length / GROUP_PAGE_SIZE)) return; state.page += 1; render(); $('result-table').scrollIntoView({ block: 'start' }); });
     $('result-rows').addEventListener('change', (event) => {
       if (state.scanning || state.cleaning || state.analysisBusy) return;
       const checkbox = event.target.closest('[data-item-id], [data-group-id]');
@@ -461,14 +454,27 @@
       const details = event.target;
       if (!details.matches('[data-group-details]')) return;
       const key = details.dataset.groupDetails;
+      if (!state.groups.has(key) || details.open === state.expanded.has(key)) return;
       if (details.open) state.expanded.add(key); else state.expanded.delete(key);
-      const group = state.groups.get(key);
-      if (!group) return;
-      const checkbox = [...$('result-rows').querySelectorAll('[data-group-id]')].find((el) => el.dataset.groupId === key);
-      if (checkbox) checkbox.disabled = state.scanning || state.cleaning || state.analysisBusy || (!group.suggested && !details.open);
-      details.querySelector('summary').textContent = !group.suggested && !details.open ? '查看文件并选择' : '查看文件详情';
+      render();
+      const replacement = [...$('result-rows').querySelectorAll('[data-group-details]')].find((el) => el.dataset.groupDetails === key);
+      replacement?.querySelector('summary')?.focus({ preventScroll: true });
     }, true);
-    $('result-rows').addEventListener('click', (event) => { const button = event.target.closest('[data-reveal-id]'); if (button) revealItem(button.dataset.revealId); });
+    $('result-rows').addEventListener('click', (event) => {
+      const pageButton = event.target.closest('[data-detail-page]');
+      if (pageButton) {
+        if (pageButton.disabled || state.scanning || state.cleaning || state.analysisBusy) return;
+        const key = pageButton.dataset.detailKey;
+        const group = state.groups.get(key);
+        if (!group) return;
+        const page = cleanupModel.pageItems(group.items, state.detailPages.get(key) || 1, PAGE_SIZE);
+        state.detailPages.set(key, page.page + (pageButton.dataset.detailPage === 'next' ? 1 : -1));
+        render();
+        return;
+      }
+      const button = event.target.closest('[data-reveal-id]');
+      if (button) revealItem(button.dataset.revealId);
+    });
     $('select-all').addEventListener('change', (event) => { if (state.scanning || state.cleaning || state.analysisBusy) return; currentPageItems().filter((item) => item.selectedByDefault === true).forEach((item) => { if (event.target.checked) state.selected.add(item.id); else state.selected.delete(item.id); }); render(); });
     $('select-safe').addEventListener('click', () => { if (state.scanning || state.cleaning || state.analysisBusy) return; activeItems().filter((item) => item.selectedByDefault === true).forEach((item) => state.selected.add(item.id)); render(); });
     $('clear-selection').addEventListener('click', () => { if (state.scanning || state.cleaning || state.analysisBusy) return; state.selected.clear(); render(); });
