@@ -64,13 +64,15 @@
               <button class="text-button" id="analysis-chart-toggle" aria-pressed="false">显示占用图</button>
               <button class="text-button" id="analysis-details-toggle" aria-pressed="false">更多信息</button>
               <button class="text-button" id="analysis-reveal" disabled>在 Finder 中显示</button>
+              <details class="analysis-storage-info hidden" id="analysis-storage-info"><summary>空间统计说明</summary><div id="analysis-space-details"></div></details>
+              <p class="analysis-permission-help hidden" id="analysis-permission-help">系统设置 → 隐私与安全性 → 完全磁盘访问权限，添加 Mac Sweep，然后重新打开应用并扫描。</p>
             </div>
           </details>
         </div>
         <div class="analysis-path" id="analysis-selected-path">选择文件夹以查看实际占用</div>
         <div class="analysis-progress hidden" id="analysis-progress" role="status" aria-live="polite"><span class="progress-spinner"></span><div><strong id="analysis-progress-label">正在计算大小…</strong><span id="analysis-progress-path"></span></div><span id="analysis-progress-count"></span><button class="text-button" id="cancel-analysis">停止</button></div>
         <div class="analysis-message hidden" id="analysis-message" role="status" aria-live="polite"></div>
-        <details class="analysis-warnings hidden" id="analysis-warnings"><summary id="analysis-warning-summary">部分文件未能读取</summary><ul id="analysis-warning-list"></ul></details>
+        <div class="analysis-notices hidden" id="analysis-notices"><details class="analysis-warnings hidden" id="analysis-warnings"><summary id="analysis-warning-summary">部分文件未能读取</summary><ul id="analysis-warning-list"></ul></details><button class="text-button hidden" id="analysis-permissions">查看访问权限</button></div>
         <div class="analysis-body">
           <div class="analysis-chart-pane"><div class="analysis-chart" id="analysis-chart"><svg viewBox="0 0 340 340" aria-hidden="true"><circle cx="170" cy="170" r="107" fill="none" stroke="var(--disk-track)" stroke-width="70"/></svg><div class="chart-center"><strong>尚未检查</strong><span>文件夹大小</span></div></div><div class="chart-caption" id="analysis-chart-caption">占用图展示已读取项目的大小</div><div class="analysis-chart-key" id="analysis-chart-key"></div><div class="analysis-snapshot" id="analysis-snapshot">检查不会更改或删除文件</div></div>
           <div class="analysis-files-pane">

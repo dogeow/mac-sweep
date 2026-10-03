@@ -13,6 +13,7 @@ fn main() {
             "analyze_directory",
             "cancel_analysis",
             "reveal_analysis_node",
+            "open_privacy_settings",
         ]),
     ))
     .expect("Could not build Mac Sweep");

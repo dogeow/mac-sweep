@@ -18,6 +18,7 @@
     "allow-choose-analysis-directory",
     "allow-analyze-directory",
     "allow-cancel-analysis",
-    "allow-reveal-analysis-node"
+    "allow-reveal-analysis-node",
+    "allow-open-privacy-settings"
   ]
 }

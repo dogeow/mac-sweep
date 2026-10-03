@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod analyzer;
+mod disk;
 mod scanner;
 
 use scanner::{ScanOptions, ScanSnapshot};
@@ -71,6 +72,33 @@ fn get_analysis_locations(state: State<'_, CleanerState>) -> Value {
     ])
 }
 
+fn analysis_value(report: &analyzer::AnalysisReport) -> Result<Value, String> {
+    let mut value = serde_json::to_value(report).map_err(|error| error.to_string())?;
+    match disk::storage_summary(&PathBuf::from(&report.root.path)) {
+        Ok(storage) => {
+            value["storage"] = serde_json::to_value(storage).map_err(|error| error.to_string())?;
+        }
+        Err(error) => {
+            value["storage"] = Value::Null;
+            value["storageWarning"] = Value::String(error);
+        }
+    }
+    Ok(value)
+}
+
+#[tauri::command]
+fn open_privacy_settings() -> Result<(), String> {
+    let status = Command::new("/usr/bin/open")
+        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
+        .status()
+        .map_err(|error| error.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("无法打开系统设置，请手动打开隐私与安全性中的完全磁盘访问权限".into())
+    }
+}
+
 #[tauri::command]
 async fn choose_analysis_directory(
     app: tauri::AppHandle,
@@ -122,16 +150,17 @@ async fn analyze_directory(
         cancel.store(false, Ordering::Release);
     }
     let result = tauri::async_runtime::spawn_blocking(move || {
-        analyzer::analyze(&PathBuf::from(path), &cancel, |progress| {
+        let report = analyzer::analyze(&PathBuf::from(path), &cancel, |progress| {
             let _ = app.emit("analysis-progress", progress);
-        })
+        })?;
+        let value = analysis_value(&report)?;
+        Ok::<_, String>((report, value))
     })
     .await;
     let mut guard = session.lock().map_err(|_| "分析状态不可用")?;
     guard.operation = Operation::Idle;
     match result {
-        Ok(Ok(report)) => {
-            let value = serde_json::to_value(&report).map_err(|e| e.to_string())?;
+        Ok(Ok((report, value))) => {
             guard.analyses.push_front(report);
             guard.analyses.truncate(8);
             Ok(value)
@@ -465,10 +494,23 @@ fn main() {
             .nth(2)
             .map(PathBuf::from)
             .unwrap_or_else(|| home.clone());
-        match analyzer::analyze(&path, &AtomicBool::new(false), |_| {}) {
+        let show_progress = std::env::var("MAC_SWEEP_SCAN_PROGRESS").as_deref() == Ok("1");
+        let last_progress = std::cell::Cell::new(std::time::Instant::now());
+        match analyzer::analyze(&path, &AtomicBool::new(false), |progress| {
+            if show_progress && last_progress.get().elapsed() >= std::time::Duration::from_secs(5) {
+                eprintln!(
+                    "Scanned {} files; measured {} bytes",
+                    progress.scanned_files, progress.bytes_found
+                );
+                last_progress.set(std::time::Instant::now());
+            }
+        }) {
             Ok(report) => println!(
                 "{}",
-                serde_json::to_string_pretty(&report).expect("serializable analysis")
+                serde_json::to_string_pretty(
+                    &analysis_value(&report).expect("serializable analysis")
+                )
+                .expect("serializable analysis")
             ),
             Err(error) => {
                 eprintln!("{error}");
@@ -504,7 +546,8 @@ fn main() {
             choose_analysis_directory,
             analyze_directory,
             cancel_analysis,
-            reveal_analysis_node
+            reveal_analysis_node,
+            open_privacy_settings
         ])
         .on_menu_event(|app, event| {
             let id = event.id.as_ref();

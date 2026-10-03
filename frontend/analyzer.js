@@ -16,6 +16,40 @@
     const index = Math.min(Math.floor(Math.log(number) / Math.log(1000)), units.length - 1);
     return `${(number / 1000 ** index).toLocaleString('zh-CN', { maximumFractionDigits: 1 })} ${units[index]}`;
   };
+  function storageAccounting(node, report) {
+    const storage = report?.storage;
+    if (!node || !storage || storage.isVolumeRoot !== true || node.path !== report.root?.path) return null;
+    const finiteSize = (value) => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+    if (![storage.totalBytes, storage.availableBytes, storage.usedBytes].every(finiteSize)) return null;
+    const located = Math.max(0, Number(node.bytes) || 0);
+    const otherVolumesKnown = finiteSize(storage.otherVolumesBytes);
+    const otherVolumes = otherVolumesKnown ? storage.otherVolumesBytes : 0;
+    const volumeUsed = finiteSize(storage.volumeUsedBytes) ? storage.volumeUsedBytes : Math.max(0, storage.usedBytes - otherVolumes);
+    const differentMeasurement = located > volumeUsed || located + otherVolumes > storage.usedBytes;
+    return { storage, located, otherVolumes, otherVolumesKnown, volumeUsed, differentMeasurement, unlocated: differentMeasurement ? null : Math.max(0, storage.usedBytes - located - otherVolumes) };
+  }
+  function renderStorageDetails(accounting) {
+    const coverage = current()?.report;
+    const otherErrors = Math.max(0, Number(coverage?.otherErrorCount || 0) - Number(coverage?.blockedDirectoryCount || 0));
+    const issues = [Number(coverage?.permissionDeniedCount || 0) ? `无权读取 ${Number(coverage.permissionDeniedCount).toLocaleString()} 处` : '', otherErrors ? `其他读取失败 ${otherErrors.toLocaleString()} 处` : '', Number(coverage?.skippedMountCount || 0) ? `跳过其他挂载 ${Number(coverage.skippedMountCount).toLocaleString()} 处` : '', Number(coverage?.changedDirectoryCount || 0) ? `扫描期间变化 ${Number(coverage.changedDirectoryCount).toLocaleString()} 处` : '', Number(coverage?.depthLimitedCount || 0) ? `未继续展开 ${Number(coverage.depthLimitedCount).toLocaleString()} 处` : '', Number(coverage?.cloudPlaceholderCount || 0) ? `${Number(coverage.cloudPlaceholderCount).toLocaleString()} 处云盘在线占位（未下载）` : '', Number(coverage?.blockedDirectoryCount || 0) ? `受保护目录未读取 ${Number(coverage.blockedDirectoryCount).toLocaleString()} 处` : ''].filter(Boolean);
+    $('analysis-storage-info').classList.toggle('hidden', !accounting && !issues.length);
+    $('analysis-storage-info').querySelector('summary').textContent = accounting ? '空间统计说明' : '扫描说明';
+    if (!accounting) { $('analysis-space-details').innerHTML = issues.length ? `<p>本次分析：${escape(issues.join(' · '))}</p><p>只统计能够读取的本机文件块。${Number(coverage?.cloudPlaceholderCount || 0) ? '云盘在线内容未下载，不按云端文件大小计入本机占用。' : ''}</p>` : ''; return; }
+    const { storage, located, otherVolumes, otherVolumesKnown, unlocated, differentMeasurement } = accounting;
+    const rows = [['磁盘总容量', storage.totalBytes], ['系统已用', storage.usedBytes], ['系统可用', storage.availableBytes], ['已定位文件', located]];
+    if (otherVolumes > 0) rows.push(['其他 APFS 卷', otherVolumes]);
+    if (unlocated !== null) rows.push(['未定位', unlocated]);
+    const isApfs = String(storage.filesystem || '').toLowerCase() === 'apfs';
+    const unknownVolumes = isApfs ? otherVolumesKnown ? '其他 APFS 卷不属于当前文件夹。' : '其他 APFS 卷的占用尚未细分，也可能包含在未定位空间内。' : '';
+    $('analysis-space-details').innerHTML = `<dl>${rows.map(([label, value]) => `<dt>${escape(label)}</dt><dd>${formatBytes(value)}</dd>`).join('')}</dl><p>系统已用来自 macOS 的空间计量；已定位文件来自本次能读取的文件块统计。</p>${differentMeasurement ? '<p class="storage-accounting-warning">文件块统计与系统计量不同，可能包含共享块重复计量。两者不能直接相减。</p>' : `<p>未定位空间可能包括无权读取的文件、快照和文件系统开销，不能直接清理。${unknownVolumes}</p>`}${issues.length ? `<p>本次分析：${escape(issues.join(' · '))}</p>` : ''}<p>${escape(storage.filesystem || '文件系统')} · ${escape(storage.source || 'macOS 系统空间计量')}</p>`;
+  }
+  function accountingRows(accounting) {
+    if (!accounting) return '';
+    const rows = [];
+    if (accounting.otherVolumes > 0) rows.push(['其他 APFS 卷', accounting.otherVolumes, '当前卷之外的系统占用']);
+    if (accounting.unlocated > 0) rows.push(['未归到文件夹的空间', accounting.unlocated, '查看统计说明，不能直接清理']);
+    return rows.map(([label, size, detail]) => `<tr class="analysis-accounting-row"><td><button class="analysis-accounting-label" data-analysis-accounting aria-label="${escape(label)}，查看统计说明">${icon('info')}<span>${escape(label)}<small>${escape(detail)}</small></span></button></td><td class="analysis-size">${formatBytes(size)}</td><td class="analysis-accounting-kind">系统计量</td><td></td><td></td></tr>`).join('');
+  }
   function friendlyName(node) {
     const location = state.locations.find((entry) => entry.path === node?.path);
     if (location) return location.label;
@@ -69,6 +103,7 @@
     state.chartNodes.clear();
     if (!node) return;
     const busy = app.isBusy();
+    const accounting = storageAccounting(node, current()?.report);
     const children = [...(node.children || [])].sort((a, b) => b.bytes - a.bytes);
     const displayed = children.filter((child) => child.bytes > 0).slice(0, 12);
     const measured = Math.max(0, Number(node.bytes) || 0);
@@ -106,9 +141,9 @@
       legends.push(`<div><i class="other-key"></i><span>其他已读取项目</span><small>${formatBytes(other)}</small></div>`);
     }
     const circle = total > 0 ? paths.join('') : '<circle cx="170" cy="170" r="107" fill="none" stroke="var(--disk-track)" stroke-width="70"/>';
-    $('analysis-chart').innerHTML = `<svg viewBox="0 0 340 340" role="group" aria-label="${escape(friendlyName(node))} 的大小图">${circle}</svg><div class="chart-center"><strong>${node.partial && !node.bytes ? '大小未知' : formatBytes(node.bytes)}</strong><span>${escape(friendlyName(node))}</span>${node.partial ? '<small>仅统计已读取</small>' : ''}</div>`;
+    $('analysis-chart').innerHTML = `<svg viewBox="0 0 340 340" role="group" aria-label="${escape(friendlyName(node))} 的大小图">${circle}</svg><div class="chart-center"><strong>${node.partial && !node.bytes ? '大小未知' : formatBytes(node.bytes)}</strong><span>${escape(accounting ? '已定位文件' : friendlyName(node))}</span>${node.partial ? '<small>仅统计已读取</small>' : ''}</div>`;
     $('analysis-chart-key').innerHTML = legends.slice(0, 7).join('') + (legends.length > 7 ? `<span class="chart-more">另有 ${legends.length - 7} 项，可在右侧列表查看</span>` : '');
-    $('analysis-chart-caption').textContent = node.partial ? '部分文件未读取，大小未统计完整。' : '点击色块，查看里面的文件夹。';
+    $('analysis-chart-caption').textContent = accounting ? accounting.differentMeasurement ? '文件夹块统计可能重复包含共享块，与系统计量不同。' : '已定位文件的分布，不含其他 APFS 卷和未定位空间。' : node.partial ? '部分文件未读取，大小未统计完整。' : '点击色块，查看里面的文件夹。';
   }
   function renderProgress(rebuildEmpty = false) {
     const entry = current();
@@ -131,11 +166,13 @@
   function render() {
     const entry = current();
     const node = entry?.node;
+    const accounting = storageAccounting(node, entry?.report);
+    const hasAccountingRows = !!accounting && (accounting.otherVolumes > 0 || accounting.unlocated > 0);
     const busy = app.isBusy();
     $('analysis-view').classList.toggle('simple-mode', !state.showChart);
     $('analysis-view').classList.toggle('show-details', state.showDetails);
     $('analysis-view').classList.toggle('is-scanning', state.scanning);
-    $('analysis-view').classList.toggle('no-results', !node || (!(node.children || []).length && !node.omittedChildren));
+    $('analysis-view').classList.toggle('no-results', !node || (!(node.children || []).length && !node.omittedChildren && !hasAccountingRows));
     $('analysis-empty').classList.toggle('is-loading', state.scanning && !entry);
     $('analysis-chart-toggle').textContent = state.showChart ? '收起占用图' : '显示占用图';
     $('analysis-chart-toggle').setAttribute('aria-pressed', String(state.showChart));
@@ -159,6 +196,13 @@
     $('cancel-analysis').textContent = state.cancelling ? '停止中…' : '停止';
     $('analysis-breadcrumbs').innerHTML = state.history.length ? state.history.map((item, index) => `${index ? '<span class="breadcrumb-divider">›</span>' : ''}<button data-history-index="${index}" ${busy || index === state.history.length - 1 ? 'disabled' : ''} title="${escape(state.showDetails ? item.node.path : friendlyName(item.node))}">${escape(friendlyName(item.node))}</button>`).join('') : '<span>空间占用</span>';
     renderProgress(true);
+    renderStorageDetails(accounting);
+    const permissionCount = Math.max(0, Number(entry?.report.permissionDeniedCount) || 0);
+    const blockedCount = Math.max(0, Number(entry?.report.blockedDirectoryCount) || 0);
+    const needsAccessReview = permissionCount > 0 || blockedCount > 0;
+    $('analysis-permissions').classList.toggle('hidden', !needsAccessReview);
+    $('analysis-permissions').disabled = busy || !app.desktop || app.demo;
+    if (!needsAccessReview) $('analysis-permission-help').classList.add('hidden');
     if (!node) {
       $('analysis-empty').classList.remove('hidden');
       if (!state.scanning) $('analysis-empty').innerHTML = '<strong>查看文件夹占用</strong><p>选择位置后，点击“查看大小”。</p>';
@@ -167,6 +211,7 @@
       $('analysis-table-footer').classList.remove('has-pages');
       $('analysis-table-footer').textContent = '';
       $('analysis-warnings').classList.add('hidden');
+      $('analysis-notices').classList.add('hidden');
       renderMessage();
       return;
     }
@@ -183,23 +228,26 @@
       const subtitle = child.partial ? '<small>部分未读取</small>' : child.kind === 'symlink' ? '<small>快捷链接</small>' : '';
       const caption = state.showDetails ? child.path : `${directory ? '打开' : '在 Finder 中显示'}${friendlyName(child)}`;
       return `<tr><td><button class="analysis-node-name" data-analysis-node="${escape(child.id)}" ${busy ? 'disabled' : ''} title="${escape(caption)}">${icon(directory ? 'folder' : 'file')}<span>${escape(friendlyName(child))}${subtitle}</span>${directory ? '<b>›</b>' : ''}</button></td><td class="analysis-size">${child.partial && !child.bytes ? '未知' : formatBytes(child.bytes)}</td><td class="analysis-percentage"><span>${proportion < .1 && proportion > 0 ? '&lt;0.1' : proportion.toFixed(1)}%</span><i data-percent="${Math.min(100, proportion)}"></i></td><td class="analysis-file-count">${Number(child.files || 0).toLocaleString()}</td><td class="analysis-more-action"><button class="row-reveal" data-analysis-reveal="${escape(child.id)}" title="在 Finder 中找到" aria-label="在 Finder 中找到 ${escape(child.name)}" ${busy || !app.desktop || app.demo ? 'disabled' : ''}>${icon('folder')}</button></td></tr>`;
-    }).join('') + (node.omittedChildren > 0 && state.page === pages ? `<tr class="analysis-omitted"><td>其他未展开项目<small>${Number(node.omittedChildren).toLocaleString()} 个子项</small></td><td class="analysis-size">${node.partial ? '未知' : formatBytes(omittedBytes)}</td><td colspan="3">${node.partial ? '已读取部分计入总占用；未读取占用未知' : '省略的显示项目已计入总占用'}</td></tr>` : '');
+    }).join('') + (node.omittedChildren > 0 && state.page === pages ? `<tr class="analysis-omitted"><td>其他未展开项目<small>${Number(node.omittedChildren).toLocaleString()} 个子项</small></td><td class="analysis-size">${node.partial ? '未知' : formatBytes(omittedBytes)}</td><td colspan="3">${node.partial ? '已读取部分计入总占用；未读取占用未知' : '省略的显示项目已计入总占用'}</td></tr>` : '') + (state.page === pages ? accountingRows(accounting) : '');
     $('analysis-rows').querySelectorAll('[data-percent]').forEach((element) => { element.style.width = `${Number(element.dataset.percent) || 0}%`; });
-    $('analysis-empty').classList.toggle('hidden', children.length > 0 || node.omittedChildren > 0);
-    if (!children.length && !node.omittedChildren) {
+    $('analysis-empty').classList.toggle('hidden', children.length > 0 || node.omittedChildren > 0 || hasAccountingRows);
+    if (!children.length && !node.omittedChildren && !hasAccountingRows) {
       const empty = node.kind === 'directory' && !node.hasChildren && !node.files;
       $('analysis-empty').innerHTML = `<strong>${node.partial ? '部分内容未能读取' : node.hasChildren ? '继续查看这个文件夹' : empty ? '这个文件夹为空' : '没有可展示的子项'}</strong><p>${node.partial ? '打开上方提示查看原因，再重新查看。' : node.hasChildren ? '点击“查看大小”，读取里面的文件与文件夹。' : '可以选择其他位置查看。'}</p>`;
     }
     const first = children.length ? (state.page - 1) * PAGE_SIZE + 1 : 0;
     $('analysis-table-footer').classList.toggle('has-pages', pages > 1);
     $('analysis-table-footer').innerHTML = pages > 1 ? `<span>${first}–${Math.min(state.page * PAGE_SIZE, children.length)} / ${children.length} 项</span><div class="pagination"><button class="page-button" data-analysis-page="previous" ${state.page <= 1 || busy ? 'disabled' : ''}>上一页</button><span>${state.page} / ${pages}</span><button class="page-button" data-analysis-page="next" ${state.page >= pages || busy ? 'disabled' : ''}>下一页</button></div>` : '';
-    $('analysis-status').textContent = `${friendlyName(node)} · ${node.partial && !node.bytes ? '大小未知' : formatBytes(node.bytes)}${node.partial ? ' · 仅统计已读取' : ''} · 不会修改文件`;
+    $('analysis-status').textContent = accounting ? `系统已用 ${formatBytes(accounting.storage.usedBytes)} · ${accounting.differentMeasurement ? '文件块统计' : '已定位文件'} ${formatBytes(accounting.located)} · ${accounting.differentMeasurement ? '计量不同' : `未定位 ${formatBytes(accounting.unlocated)}`}` : `${friendlyName(node)} · ${node.partial && !node.bytes ? '大小未知' : formatBytes(node.bytes)}${node.partial ? ' · 仅统计已读取' : ''} · 不会修改文件`;
     $('analysis-snapshot').textContent = `${Number(entry.report.scannedFiles || 0).toLocaleString()} 个文件 · ${(Number(entry.report.durationMs || 0) / 1000).toFixed(1)} 秒${entry.report.availableBytes >= 0 ? ` · 磁盘可用 ${formatBytes(entry.report.availableBytes)}` : ''}`;
-    const warnings = [...(entry.report.warnings || [])];
+    const warnings = [...new Set([...(entry.report.warnings || []), ...(entry.report.storage?.warnings || []), ...(typeof entry.report.storageWarning === 'string' ? [entry.report.storageWarning] : [])])];
+    if (accounting?.differentMeasurement) warnings.unshift('文件块统计与系统计量不同，可能包含共享块重复计量。当前占用图只展示文件夹统计，不能与系统已用空间直接相减。');
     if (entry.report.cancelled) warnings.unshift('扫描已停止。当前总大小仅包含已经读取的文件。');
     if (node.partial && !warnings.length) warnings.push('此目录仅统计已读取项目；未读取项目的占用未知。');
+    if (entry.report.scanComplete === false && !warnings.length) warnings.push('本次分析未读取完整；未知空间未计入已定位文件。');
     $('analysis-warnings').classList.toggle('hidden', warnings.length === 0);
-    $('analysis-warning-summary').textContent = `${entry.report.cancelled ? '查看已停止' : entry.report.root?.partial || node.partial ? '部分未读取' : '检查提示'} · ${warnings.length} 条提示`;
+    $('analysis-notices').classList.toggle('hidden', warnings.length === 0 && !needsAccessReview);
+    $('analysis-warning-summary').textContent = `${entry.report.cancelled ? '本次分析已停止' : node.partial ? '此目录部分未读取' : entry.report.root?.partial || entry.report.scanComplete === false ? '本次分析有未读取内容' : '检查提示'} · ${warnings.length} 条提示`;
     $('analysis-warning-list').innerHTML = warnings.map((warning) => `<li>${escape(warning)}</li>`).join('');
     if (state.showChart) renderChart(node);
     renderMessage();
@@ -297,7 +345,15 @@
     try { const path = await invoke('choose_analysis_directory'); if (path) setPath(path); }
     catch (error) { message('error', `无法打开文件夹选择器：${errorText(error)}`); }
   }
+  async function openPrivacySettings() {
+    if (!app.desktop || app.demo || app.isBusy()) return;
+    $('analysis-permission-help').classList.remove('hidden');
+    $('analysis-options').open = true;
+    try { await invoke('open_privacy_settings'); }
+    catch (error) { message('error', `无法打开系统设置：${errorText(error)}。请按“更多”中的路径手动打开。`); }
+  }
   function bind() {
+    $('analysis-permissions').addEventListener('click', openPrivacySettings);
     $('analysis-chart-toggle').addEventListener('click', () => { state.showChart = !state.showChart; closeOptions(true); render(); });
     $('analysis-details-toggle').addEventListener('click', () => { state.showDetails = !state.showDetails; closeOptions(true); render(); });
     $('analysis-location').addEventListener('change', (event) => setPath(event.target.value));
@@ -309,6 +365,8 @@
     $('check-cleanup-suggestions').addEventListener('click', () => { if (!app.isBusy()) app.showCleanupAndScan(); });
     $('analysis-breadcrumbs').addEventListener('click', (event) => { const button = event.target.closest('[data-history-index]'); if (button) goBack(Number(button.dataset.historyIndex)); });
     $('analysis-view').addEventListener('click', (event) => {
+      const accountingButton = event.target.closest('[data-analysis-accounting]');
+      if (accountingButton) { $('analysis-options').open = true; $('analysis-storage-info').open = true; $('analysis-storage-info').querySelector('summary').focus(); return; }
       const cancelButton = event.target.closest('[data-analysis-cancel]');
       if (cancelButton && !cancelButton.disabled) { cancel(); return; }
       const revealButton = event.target.closest('[data-analysis-reveal]');
@@ -318,7 +376,7 @@
     });
     $('analysis-chart').addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') { const segment = event.target.closest('[data-analysis-node]'); if (segment) { event.preventDefault(); drill(state.chartNodes.get(segment.dataset.analysisNode)); } } });
     $('analysis-table-footer').addEventListener('click', (event) => { const button = event.target.closest('[data-analysis-page]'); if (!button || button.disabled || app.isBusy()) return; state.page += button.dataset.analysisPage === 'next' ? 1 : -1; render(); $('analysis-rows').closest('.analysis-table-scroll').scrollTop = 0; });
-    document.addEventListener('click', (event) => { if (!event.target.closest('#analysis-options')) closeOptions(); });
+    document.addEventListener('click', (event) => { if (!event.target.closest('#analysis-options, [data-analysis-accounting], #analysis-permissions')) closeOptions(); });
     document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && $('analysis-options').open) closeOptions(true); });
     window.addEventListener('mac-sweep-view', () => render());
   }

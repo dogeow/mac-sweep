@@ -1,6 +1,6 @@
 {
   "name": "mac-sweep",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "description": "A local macOS disk scanner with recoverable one-click cleanup",
   "scripts": {
