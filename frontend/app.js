@@ -60,13 +60,14 @@
   const errorText = (error) => typeof error === 'string' ? error : error?.message || '操作未能完成，请重试。';
   const currentPageItems = () => visibleItems().slice((state.page - 1) * PAGE_SIZE, state.page * PAGE_SIZE);
   function setMessage(type, title, detail = '', canOpenTrash = false) {
-    state.message = { type, title, detail, canOpenTrash };
+    state.message = { type, title, detail, canOpenTrash, context: state.view === 'analysis' ? 'analysis' : 'cleanup' };
     renderMessage();
   }
   function renderMessage() {
     const panel = $('message-panel');
-    panel.classList.toggle('hidden', !state.message);
-    if (!state.message) return;
+    const visible = state.message && state.message.context === (state.view === 'analysis' ? 'analysis' : 'cleanup');
+    panel.classList.toggle('hidden', !visible);
+    if (!visible) return;
     const message = state.message;
     panel.className = `message-panel ${message.type}`;
     panel.innerHTML = `${icon(message.type === 'success' ? 'check-circle' : 'info')}<div><strong>${escape(message.title)}</strong>${message.detail ? `<p>${escape(message.detail)}</p>` : ''}</div>${message.canOpenTrash ? '<button class="text-button" data-open-trash>打开废纸篓</button>' : ''}<button class="message-dismiss" aria-label="关闭提示">×</button>`;
@@ -198,7 +199,7 @@
       $(`show-${view}`).disabled = state.cleaning || (view !== state.view && (state.scanning || state.analysisBusy));
     });
     $('toggle-settings').classList.toggle('hidden', state.view !== 'cleanup');
-    $('start-scan').classList.toggle('hidden', state.view === 'home' && !state.report);
+    $('start-scan').classList.toggle('hidden', state.view === 'home');
     $('home-view').classList.toggle('hidden', state.view !== 'home');
     $('analysis-view').classList.toggle('hidden', state.view !== 'analysis');
     $('analysis-statusbar').classList.toggle('hidden', state.view !== 'analysis');
@@ -266,6 +267,7 @@
     renderHome();
     renderWarnings();
     renderReceipts();
+    renderMessage();
   }
   function applyReport(report) {
     if (!report || !Array.isArray(report.items) || typeof report.scanId !== 'string') throw new Error('扫描结果格式无效，已保留之前的结果。');
