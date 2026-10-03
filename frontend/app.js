@@ -37,7 +37,7 @@
   const PAGE_SIZE = 100;
   const GROUP_PAGE_SIZE = 30;
   const cleanupModel = window.MacSweepCleanup;
-  const state = { view: 'home', analysisBusy: false, report: null, diskOverview: null, diskUnavailable: false, selected: new Set(), moved: new Set(), failures: new Map(), receipts: [], groups: new Map(), expanded: new Set(), expandedTree: new Set(), expandedFileInfo: new Set(), treePages: new Map(), treeNodes: new Map(), filter: 'all', search: '', risk: 'all', sort: 'size-desc', page: 1, scanning: false, cancelling: false, cleaning: false, scanRevision: 0, dialogSelection: null, previousFocus: null, message: null, extraWarnings: [] };
+  const state = { view: 'home', analysisBusy: false, report: null, diskOverview: null, diskUnavailable: false, selected: new Set(), moved: new Set(), failures: new Map(), receipts: [], cleanOutcome: null, groups: new Map(), expanded: new Set(), expandedTree: new Set(), expandedFileInfo: new Set(), treePages: new Map(), treeNodes: new Map(), filter: 'all', search: '', risk: 'all', sort: 'size-desc', page: 1, scanning: false, cancelling: false, cleaning: false, scanRevision: 0, dialogSelection: null, previousFocus: null, message: null, extraWarnings: [] };
   const bytes = (value) => {
     const number = Number(value) || 0;
     if (number === 0) return '0 B';
@@ -75,6 +75,28 @@
     panel.className = `message-panel ${message.type}`;
     panel.innerHTML = `${icon(message.type === 'success' ? 'check-circle' : 'info')}<div><strong>${escape(message.title)}</strong>${message.detail ? `<p>${escape(message.detail)}</p>` : ''}</div>${message.canOpenTrash ? '<button class="text-button" data-open-trash>打开废纸篓</button>' : ''}<button class="message-dismiss" aria-label="关闭提示">×</button>`;
   }
+  function renderCleanOutcome() {
+    renderReceiptAction();
+    const panel = $('cleanup-outcome');
+    if (!panel) return;
+    const outcome = state.cleanOutcome;
+    const busy = state.scanning || state.cleaning || state.analysisBusy;
+    const visible = outcome && state.view === 'cleanup' && !busy && !$('cleanup-dialog').open;
+    panel.classList.toggle('hidden', !visible);
+    if (!visible) return;
+    const hasRecords = state.receipts.length > 0;
+    const canOpenTrash = desktop && !demo && (outcome.unknown || outcome.movedCount > 0 || hasRecords);
+    panel.className = `cleanup-outcome ${outcome.type}`;
+    panel.innerHTML = `<div class="cleanup-outcome-copy">${icon(outcome.type === 'success' ? 'check-circle' : outcome.type === 'error' ? 'alert' : 'info')}<strong title="${escape(outcome.detail)}">${escape(outcome.summary)}</strong></div><div class="cleanup-outcome-actions"><button class="text-button" data-cleanup-open-trash ${canOpenTrash ? '' : 'disabled'}>打开废纸篓</button><button class="text-button" data-cleanup-view-records ${hasRecords ? '' : 'disabled'}>查看记录</button><button class="cleanup-outcome-dismiss" data-cleanup-dismiss aria-label="关闭清理结果">×</button></div>`;
+  }
+  function viewCleanupRecords() {
+    if (state.view !== 'cleanup' || state.scanning || state.cleaning || state.analysisBusy || !state.receipts.length) return;
+    renderReceipts();
+    const panel = $('receipt-panel');
+    panel.open = true;
+    panel.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    panel.querySelector('summary')?.focus({ preventScroll: true });
+  }
   function renderWarnings() {
     const warnings = [...(state.report?.warnings || []), ...state.extraWarnings];
     const panel = $('warning-panel');
@@ -89,6 +111,13 @@
     $('receipt-panel').classList.toggle('hidden', state.receipts.length === 0);
     $('receipt-summary').textContent = `已移动 ${state.receipts.length} 项 · 查看记录与原位置`;
     $('receipt-list').innerHTML = state.receipts.map((item) => `<li><div><strong>${escape(item.name)}</strong><span>${bytes(item.bytes)} · ${escape(item.movedAt)}</span></div><code>${escape(item.path)}</code></li>`).join('');
+    renderReceiptAction();
+  }
+  function renderReceiptAction() {
+    const button = $('show-receipts');
+    if (!button) return;
+    button.classList.toggle('hidden', state.receipts.length === 0 || Boolean(state.cleanOutcome));
+    button.disabled = state.scanning || state.cleaning || state.analysisBusy;
   }
   function renderDisk() {
     const disk = state.diskOverview || state.report?.disk;
@@ -285,7 +314,9 @@
     renderHome();
     renderWarnings();
     renderReceipts();
+    renderCleanOutcome();
     renderMessage();
+    window.dispatchEvent(new CustomEvent('mac-sweep-state'));
   }
   function applyReport(report) {
     if (!report || !Array.isArray(report.items) || typeof report.scanId !== 'string') throw new Error('扫描结果格式无效，已保留之前的结果。');
@@ -308,6 +339,7 @@
     state.scanning = true;
     state.cancelling = false;
     state.message = null;
+    state.cleanOutcome = null;
     renderMessage();
     $('progress-title').textContent = '正在扫描本机文件…';
     $('progress-detail').textContent = '正在准备扫描位置';
@@ -340,6 +372,8 @@
     const selected = selectedItems();
     if (!desktop || demo || state.scanning || state.cleaning || !selected.length) return;
     state.dialogSelection = { scanId: state.report.scanId, itemIds: selected.map((item) => item.id) };
+    state.cleanOutcome = null;
+    renderCleanOutcome();
     state.previousFocus = document.activeElement;
     $('dialog-count').textContent = `${selected.length} 个项目`;
     $('dialog-bytes').textContent = bytes(sum(selected));
@@ -364,10 +398,21 @@
     state.dialogSelection = null;
     if (state.previousFocus?.isConnected) state.previousFocus.focus();
   }
+  function validCleanupReport(report, request) {
+    if (!report || !Array.isArray(report.moved) || !Array.isArray(report.failed) || !Number.isFinite(report.bytesMoved) || report.bytesMoved < 0) return false;
+    const requested = new Set(request.itemIds);
+    const seen = new Set();
+    for (const item of [...report.moved, ...report.failed]) {
+      if (!item || typeof item.id !== 'string' || !requested.has(item.id) || seen.has(item.id) || typeof item.path !== 'string' || !item.path || !Number.isFinite(item.bytes) || item.bytes < 0) return false;
+      seen.add(item.id);
+    }
+    return seen.size === requested.size && (report.moved.length > 0 || report.bytesMoved === 0);
+  }
   async function cleanup() {
     const request = state.dialogSelection;
     if (!desktop || demo || !request || state.cleaning || state.scanning || request.scanId !== state.report?.scanId) return;
     state.cleaning = true;
+    state.cleanOutcome = null;
     $('dialog-cancel').disabled = true;
     $('dialog-confirm').disabled = true;
     $('dialog-confirm').textContent = '正在移动…';
@@ -377,15 +422,22 @@
     render();
     try {
       const report = await invoke('clean_items', request);
-      if (!report || !Array.isArray(report.moved) || !Array.isArray(report.failed)) throw new Error('清理结果格式无效。请在 Finder 检查文件位置后重新扫描。');
+      if (!validCleanupReport(report, request)) throw new Error('清理回执不完整或格式无效。请在 Finder 检查文件位置后重新扫描。');
       const movedAt = new Date().toLocaleString('zh-CN', { hour12: false });
       const sourceById = new Map((state.report?.items || []).map((item) => [item.id, item]));
       report.moved.forEach((item) => { state.receipts.unshift({ path: item.path, name: sourceById.get(item.id)?.name || String(item.path).split('/').pop(), bytes: item.bytes, movedAt }); });
       report.moved.forEach((item) => { state.moved.add(item.id); state.selected.delete(item.id); state.failures.delete(item.id); });
       report.failed.forEach((item) => { state.failures.set(item.id, item.error || '移动失败'); });
-      const detail = report.failed.length ? `${report.failed.length} 项未能移动，已保留选择，详情显示在列表中。废纸篓需由你在 Finder 中自行清空。` : '可在 Finder 废纸篓中找回。自行清空废纸篓后才会释放磁盘空间。';
-      setMessage(report.failed.length ? 'info' : 'success', `已将 ${report.moved.length} 个项目（${bytes(report.bytesMoved)}）移到废纸篓`, detail, true);
-    } catch (error) { setMessage('error', '清理未能完成', `${errorText(error)} 请检查 Finder 中的文件状态，必要时重新扫描。`); }
+      const failed = report.failed.length;
+      const moved = report.moved.length;
+      state.cleanOutcome = {
+        type: failed ? 'info' : 'success', movedCount: moved, bytesMoved: report.bytesMoved, failedCount: failed, unknown: false,
+        summary: `${moved ? `已移到废纸篓 ${moved} 项 · ${bytes(report.bytesMoved)}` : ''}${failed ? `${moved ? ' · ' : ''}${failed} 项未完成，选择已保留` : ''}`,
+        detail: failed ? '未完成的项目仍保留选择，展开对应文件可查看原因。确认废纸篓中的文件不再需要后，再自行清空。' : '文件可在 Finder 废纸篓中找回。确认不再需要后，再自行清空；移入废纸篓不会立即释放空间。',
+      };
+    } catch (error) {
+      state.cleanOutcome = { type: 'error', unknown: true, summary: '清理结果未确认，请检查文件状态', detail: `${errorText(error)} 请检查 Finder 中的原文件与废纸篓，必要时重新扫描。` };
+    }
     finally { state.cleaning = false; closeReview(); render(); refreshDisk(); }
   }
   async function openTrash() {
@@ -453,7 +505,8 @@
     $('show-cleanup').addEventListener('click', () => setView('cleanup'));
     $('cancel-scan').addEventListener('click', cancelScan);
     $('open-trash').addEventListener('click', openTrash);
-    $('clear-receipts').addEventListener('click', () => { state.receipts = []; renderReceipts(); });
+    $('clear-receipts').addEventListener('click', () => { state.receipts = []; state.cleanOutcome = null; $('receipt-panel').open = false; renderReceipts(); renderCleanOutcome(); });
+    $('show-receipts')?.addEventListener('click', viewCleanupRecords);
     $('show-analysis').addEventListener('click', () => setView('analysis'));
     document.querySelector('.brand').addEventListener('click', (event) => { event.preventDefault(); setView('home'); });
     document.querySelectorAll('[data-category]').forEach((button) => button.addEventListener('click', () => { if (!setView('cleanup')) return; state.filter = button.dataset.category; state.page = 1; render(); }));
@@ -555,6 +608,18 @@
     $('message-panel').addEventListener('click', (event) => {
       if (event.target.closest('[data-open-trash]')) openTrash();
       if (event.target.closest('.message-dismiss')) { state.message = null; renderMessage(); }
+    });
+    $('cleanup-outcome')?.addEventListener('click', (event) => {
+      const button = event.target.closest('[data-cleanup-open-trash], [data-cleanup-view-records], [data-cleanup-dismiss]');
+      if (!button || button.disabled || state.view !== 'cleanup' || state.scanning || state.cleaning || state.analysisBusy) return;
+      if (button.hasAttribute('data-cleanup-open-trash')) openTrash();
+      else if (button.hasAttribute('data-cleanup-view-records')) viewCleanupRecords();
+      else {
+        state.cleanOutcome = null;
+        renderCleanOutcome();
+        const focus = !$('review-cleanup').disabled ? $('review-cleanup') : !$('start-scan').disabled ? $('start-scan') : $('show-cleanup');
+        focus.focus({ preventScroll: true });
+      }
     });
   }
   function demoReport() {

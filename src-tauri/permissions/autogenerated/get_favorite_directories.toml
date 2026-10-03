@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-favorite-directories"
+description = "Enables the get_favorite_directories command without any pre-configured scope."
+commands.allow = ["get_favorite_directories"]
+
+[[permission]]
+identifier = "deny-get-favorite-directories"
+description = "Denies the get_favorite_directories command without any pre-configured scope."
+commands.deny = ["get_favorite_directories"]

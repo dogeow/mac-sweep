@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-resolve-favorite-directory"
+description = "Enables the resolve_favorite_directory command without any pre-configured scope."
+commands.allow = ["resolve_favorite_directory"]
+
+[[permission]]
+identifier = "deny-resolve-favorite-directory"
+description = "Denies the resolve_favorite_directory command without any pre-configured scope."
+commands.deny = ["resolve_favorite_directory"]

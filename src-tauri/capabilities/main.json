@@ -20,6 +20,11 @@
     "allow-analyze-directory",
     "allow-browse-analysis-directory",
     "allow-inspect-analysis-node",
+    "allow-get-favorite-directories",
+    "allow-add-favorite-directory",
+    "allow-remove-favorite-directory",
+    "allow-resolve-favorite-directory",
+    "allow-open-favorite-directory",
     "allow-cancel-analysis",
     "allow-reveal-analysis-node",
     "allow-open-privacy-settings"

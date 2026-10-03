@@ -2,12 +2,13 @@
   'use strict';
   const app = window.macSweep;
   const navigation = window.macSweepAnalysisNavigation;
+  const favorites = window.macSweepFavorites;
   if (!app || !navigation) return;
   const $ = (id) => document.getElementById(id);
   const escape = app.escapeHtml;
   const icon = app.icon;
   const invoke = (command, args) => window.__TAURI__.core.invoke(command, args);
-  const state = { locations: [], path: '', history: [], revision: 0, scanning: false, browsing: false, recovering: false, cancelling: false, page: 1, sort: 'size-desc', chartNodes: new Map(), browseCache: new Map(), invalidatedNodes: new Map(), staleDirectories: new Map(), emptyReason: null, message: null, showChart: false, showDetails: false, scanPath: '', progress: null, scanStartedAt: 0, lastProgressAt: 0, progressTimer: null };
+  const state = { locations: [], path: '', history: [], revision: 0, favoriteRevision: 0, scanning: false, browsing: false, openingFavorite: false, recovering: false, cancelling: false, page: 1, sort: 'size-desc', chartNodes: new Map(), browseCache: new Map(), invalidatedNodes: new Map(), staleDirectories: new Map(), emptyReason: null, message: null, showChart: false, showDetails: false, scanPath: '', progress: null, scanStartedAt: 0, lastProgressAt: 0, progressTimer: null };
   const PAGE_SIZE = 100;
   const palette = ['#5b94ce', '#8b86c6', '#6aaa97', '#bf9167', '#b17eaa', '#829bb5', '#a39a6a', '#7188b9', '#ba8d85', '#8eaa78', '#8398a2', '#a29bb8'];
   const formatBytes = (value) => {
@@ -245,9 +246,10 @@
     $('analysis-progress-path').classList.toggle('hidden', state.browsing);
     $('analysis-progress-count').classList.toggle('hidden', state.browsing);
     if (state.browsing) {
-      $('analysis-progress-label').textContent = state.cancelling ? '正在停止打开目录…' : `${state.recovering ? '正在更新列表' : '正在打开目录'}：${friendlyPath(state.scanPath)}`;
+      $('analysis-progress-label').textContent = state.cancelling ? '正在停止打开目录…' : `${state.openingFavorite ? '正在打开收藏' : state.recovering ? '正在更新列表' : '正在打开目录'}：${friendlyPath(state.scanPath)}`;
       $('analysis-progress-count').textContent = '';
       $('analysis-progress-path').textContent = '';
+      if (state.openingFavorite && !entry) $('analysis-empty').innerHTML = `<span class="progress-spinner" aria-hidden="true"></span><strong>正在打开收藏目录…</strong><p>正在确认目录是否可用。</p><button class="text-button" data-analysis-cancel ${state.cancelling ? 'disabled' : ''}>${state.cancelling ? '取消中…' : '取消打开'}</button>`;
       return;
     }
     const progress = state.progress;
@@ -311,7 +313,18 @@
     $('analysis-view').classList.toggle('show-details', state.showDetails);
     $('analysis-view').classList.toggle('is-scanning', state.scanning || state.browsing);
     $('analysis-view').classList.toggle('no-results', !node || (!(node.children || []).length && !node.omittedChildren && !hasAccountingRows));
-    $('analysis-empty').classList.toggle('is-loading', state.scanning && !entry);
+    $('analysis-empty').classList.toggle('is-loading', (state.scanning || state.openingFavorite) && !entry);
+    favorites?.setCurrent(node?.path || '');
+    const favoriteButton = $('analysis-favorite');
+    if (favoriteButton) {
+      const filled = Boolean(node && favorites?.has(node.path));
+      favoriteButton.innerHTML = `${favorites?.icon(filled) || ''}<span>${filled ? '已收藏' : '收藏'}</span>`;
+      favoriteButton.classList.toggle('is-favorite', filled);
+      favoriteButton.classList.toggle('hidden', app.getView() !== 'analysis');
+      favoriteButton.setAttribute('aria-pressed', String(filled));
+      favoriteButton.setAttribute('aria-label', filled ? '取消收藏当前目录' : '收藏当前目录');
+      favoriteButton.disabled = busy || !favorites || !favorites.canEdit() || !node || node.kind !== 'directory' || node.unavailable || !app.desktop || app.demo;
+    }
     $('analysis-chart-toggle').textContent = state.showChart ? '收起占用图' : '显示占用图';
     $('analysis-chart-toggle').setAttribute('aria-pressed', String(state.showChart));
     $('analysis-details-toggle').textContent = state.showDetails ? '收起详细信息' : '详细信息';
@@ -348,7 +361,7 @@
     if (!needsAccessReview) $('analysis-permission-help').classList.add('hidden');
     if (!node) {
       $('analysis-empty').classList.remove('hidden');
-      if (!state.scanning) $('analysis-empty').innerHTML = state.emptyReason ? '<strong>这个位置已无法打开</strong><p>选择其他位置，再开始分析。</p>' : '<strong>查看文件夹占用</strong><p>选择位置后，点击“开始分析”。</p>';
+      if (!state.scanning && !state.openingFavorite) $('analysis-empty').innerHTML = state.emptyReason ? '<strong>这个位置已无法打开</strong><p>选择其他位置，再开始分析。</p>' : '<strong>查看文件夹占用</strong><p>选择位置后，点击“开始分析”。</p>';
       $('analysis-rows').innerHTML = '';
       $('analysis-status').textContent = '只查看占用，不会修改文件';
       $('analysis-table-footer').classList.remove('has-pages');
@@ -372,7 +385,9 @@
       const proportion = knownProportion && node.bytes > 0 ? child.bytes / node.bytes * 100 : 0;
       const subtitle = !known ? '<small>目录大小尚未统计</small>' : child.stale ? '<small>占用需更新</small>' : child.partial ? '<small>部分未读取</small>' : child.kind === 'symlink' ? '<small>快捷链接</small>' : '';
       const caption = state.showDetails ? child.path : `${directory ? '打开' : '在 Finder 中显示'}${friendlyName(child)}`;
-      return `<tr><td><button class="analysis-node-name" data-analysis-node="${escape(child.id)}" ${busy ? 'disabled' : ''} title="${escape(caption)}">${icon(directory ? 'folder' : 'file')}<span>${escape(friendlyName(child))}${subtitle}</span>${directory ? '<b>›</b>' : ''}</button></td><td class="analysis-size">${sizeLabel(child)}</td><td class="analysis-percentage"><span>${knownProportion ? `${proportion < .1 && proportion > 0 ? '&lt;0.1' : proportion.toFixed(1)}%` : '待分析'}</span>${knownProportion ? `<i data-percent="${Math.min(100, proportion)}"></i>` : ''}</td><td class="analysis-file-count">${known ? Number(child.files || 0).toLocaleString() : '—'}</td><td class="analysis-more-action"><button class="row-reveal" data-analysis-reveal="${escape(child.id)}" title="在 Finder 中找到" aria-label="在 Finder 中找到 ${escape(child.name)}" ${busy || !app.desktop || app.demo ? 'disabled' : ''}>${icon('folder')}</button></td></tr>`;
+      const filled = directory && Boolean(favorites?.has(child.path));
+      const favoriteAction = directory && favorites ? `<button class="analysis-favorite-action favorite-toggle${filled ? ' is-favorite' : ''}" data-analysis-favorite="${escape(child.id)}" aria-label="${filled ? '取消收藏' : '收藏'} ${escape(friendlyName(child))}" aria-pressed="${filled}" title="${filled ? '取消收藏' : '收藏目录'}" ${busy || !favorites.canEdit() || !app.desktop || app.demo ? 'disabled' : ''}>${favorites.icon(filled)}</button>` : '';
+      return `<tr><td><div class="analysis-name-cell"><button class="analysis-node-name" data-analysis-node="${escape(child.id)}" ${busy ? 'disabled' : ''} title="${escape(caption)}">${icon(directory ? 'folder' : 'file')}<span>${escape(friendlyName(child))}${subtitle}</span>${directory ? '<b>›</b>' : ''}</button>${favoriteAction}</div></td><td class="analysis-size">${sizeLabel(child)}</td><td class="analysis-percentage"><span>${knownProportion ? `${proportion < .1 && proportion > 0 ? '&lt;0.1' : proportion.toFixed(1)}%` : '待分析'}</span>${knownProportion ? `<i data-percent="${Math.min(100, proportion)}"></i>` : ''}</td><td class="analysis-file-count">${known ? Number(child.files || 0).toLocaleString() : '—'}</td><td class="analysis-more-action"><button class="row-reveal" data-analysis-reveal="${escape(child.id)}" title="在 Finder 中找到" aria-label="在 Finder 中找到 ${escape(child.name)}" ${busy || !app.desktop || app.demo ? 'disabled' : ''}>${icon('folder')}</button></td></tr>`;
     }).join('') + (node.omittedChildren > 0 && state.page === pages ? `<tr class="analysis-omitted"><td>其他未展开项目<small>${Number(node.omittedChildren).toLocaleString()} 个子项</small></td><td class="analysis-size">${!sizeKnown(node) ? '待分析' : node.partial ? '未知' : formatBytes(omittedBytes)}</td><td colspan="3">${!sizeKnown(node) ? '目录大小尚未统计' : node.partial ? '已读取部分计入总占用；未读取占用未知' : '省略的显示项目已计入总占用'}</td></tr>` : '') + (state.page === pages ? accountingRows(accounting) : '');
     $('analysis-rows').querySelectorAll('[data-percent]').forEach((element) => { element.style.width = `${Number(element.dataset.percent) || 0}%`; });
     $('analysis-empty').classList.toggle('hidden', children.length > 0 || node.omittedChildren > 0 || hasAccountingRows);
@@ -525,8 +540,7 @@
     const cacheKey = `${sourceReport.analysisId}\u0000${node.id}`;
     const cached = state.browseCache.get(cacheKey);
     if (cached) {
-      await openCachedDirectory(node, parents, sourceReport, cached);
-      return;
+      return openCachedDirectory(node, parents, sourceReport, cached);
     }
     const contextEntry = current();
     const revision = ++state.revision;
@@ -543,15 +557,17 @@
       const report = await invoke('browse_analysis_directory', { analysisId: sourceReport.analysisId, nodeId: node.id });
       if (revision !== state.revision) return;
       if (!validReport(report) || report.root.id !== node.id || report.root.path !== node.path || report.root.kind !== 'directory') throw new Error('打开目录返回的结果格式无效。');
-      if (state.cancelling || report.cancelled) { message('info', '已停止打开目录，保留当前结果。'); return; }
-      if (listingFailed(report)) { message('error', (Number(report.permissionDeniedCount) > 0 ? '暂时无法读取这个目录，请检查访问权限后重试。' : '暂时无法读取这个目录，请稍后重试。') + '已保留当前结果。'); return; }
+      if (state.cancelling || report.cancelled) { message('info', '已停止打开目录，保留当前结果。'); return 'cancelled'; }
+      if (listingFailed(report)) { message('error', (Number(report.permissionDeniedCount) > 0 ? '暂时无法读取这个目录，请检查访问权限后重试。' : '暂时无法读取这个目录，请稍后重试。') + '已保留当前结果。'); return 'error'; }
       commitBrowse(parents, report);
       rememberBrowse(cacheKey, report);
+      return 'opened';
     } catch (error) {
       if (revision === state.revision) {
         const invalid = invalidStatus(error);
-        if (invalid) await recoverInvalidNode(node, sourceReport, contextEntry, invalid, revision);
-        else message('error', friendlyFailure(error, '打开这个目录', true));
+        if (invalid) { await recoverInvalidNode(node, sourceReport, contextEntry, invalid, revision); return 'unavailable'; }
+        message('error', friendlyFailure(error, '打开这个目录', true));
+        return /过期|expired/i.test(errorText(error)) ? 'expired' : 'error';
       }
     } finally {
       if (revision === state.revision) { state.browsing = false; state.cancelling = false; app.setAnalysisBusy(false); render(); }
@@ -571,15 +587,15 @@
     try {
       const result = await invoke('inspect_analysis_node', { analysisId: sourceReport.analysisId, nodeId: node.id });
       if (revision !== state.revision) return;
-      if (state.cancelling) { message('info', '已停止打开目录，保留当前结果。'); return; }
+      if (state.cancelling) { message('info', '已停止打开目录，保留当前结果。'); return 'cancelled'; }
       if (result?.status === 'missing' || result?.status === 'changed') {
         await recoverInvalidNode(node, sourceReport, contextEntry, result.status, revision);
-        return;
+        return 'unavailable';
       }
       if (result?.status !== 'ready') throw new Error('无法验证目录状态。');
       if (node.unavailable || state.invalidatedNodes.get(originOf(sourceReport))?.has(node.id)) {
         await recoverInvalidNode(node, sourceReport, contextEntry, 'changed', revision);
-        return;
+        return 'unavailable';
       }
       if (cachedReport) commitBrowse(parents, cachedReport);
       else {
@@ -590,11 +606,13 @@
         state.emptyReason = null;
         updateLocations();
       }
+      return 'opened';
     } catch (error) {
       if (revision === state.revision) {
         const invalid = invalidStatus(error);
-        if (invalid) await recoverInvalidNode(node, sourceReport, contextEntry, invalid, revision);
-        else message('error', friendlyFailure(error, '打开这个目录', true));
+        if (invalid) { await recoverInvalidNode(node, sourceReport, contextEntry, invalid, revision); return 'unavailable'; }
+        message('error', friendlyFailure(error, '打开这个目录', true));
+        return /过期|expired/i.test(errorText(error)) ? 'expired' : 'error';
       }
     } finally {
       if (revision === state.revision) { state.browsing = false; state.cancelling = false; app.setAnalysisBusy(false); render(); }
@@ -614,6 +632,75 @@
     const queue = [root];
     while (queue.length) { const node = queue.pop(); if (node.id === id) return node; queue.push(...(node.children || [])); }
     return null;
+  }
+  async function toggleFavorite(node = current()?.node) {
+    const entry = current();
+    if (!favorites || !favorites.canEdit() || !entry || !node || node.kind !== 'directory' || node.unavailable || app.isBusy()) return;
+    await favorites.toggle({ analysisId: entry.report.analysisId, nodeId: node.id, path: node.path });
+  }
+  async function openFavorite(favoriteId) {
+    if (!favorites || favorites.isBusy() || !app.desktop || app.demo || app.isBusy()) return false;
+    const favorite = favorites.get(favoriteId);
+    const previousView = app.getView();
+    if (!favorite || app.showAnalysis() === false) return false;
+    const favoriteRevision = ++state.favoriteRevision;
+    function restoreView() {
+      if (favoriteRevision !== state.favoriteRevision || app.isBusy() || app.getView() !== 'analysis') return;
+      if (previousView === 'home') app.showHome();
+      else if (previousView === 'cleanup') app.showCleanup?.();
+    }
+    favorites.note('');
+    const historyIndex = state.history.findIndex((entry) => entry.node.path === favorite.path && !entry.invalid && !entry.node.unavailable);
+    let result;
+    if (historyIndex >= 0) {
+      const target = state.history[historyIndex];
+      result = await openCachedDirectory(target.node, state.history.slice(0, historyIndex), target.report, null, state.history.slice(0, historyIndex + 1));
+    } else {
+      const entry = current();
+      const pending = entry ? [entry.node] : [];
+      let target = null;
+      while (pending.length) {
+        const node = pending.pop();
+        if (node.kind === 'directory' && node.path === favorite.path && !node.unavailable) { target = node; break; }
+        pending.push(...(node.children || []));
+      }
+      if (target) {
+        const plan = navigation.drillPlan(state.history, target);
+        if (plan) result = plan.needsScan ? await browseDirectory(target, plan.parents, entry.report) : await openCachedDirectory(target, plan.parents, entry.report, null, plan.history);
+      }
+    }
+    if (favoriteRevision !== state.favoriteRevision || app.getView() !== 'analysis') return false;
+    if (result === 'opened') return true;
+    if (result && result !== 'expired' && result !== 'unavailable') { favorites.note(state.message?.text || '暂时无法打开收藏目录，请稍后重试。'); restoreView(); return false; }
+    // A stored ID opens only its immediate contents. Full analysis is a separate
+    // action, even when a favorite is first opened after restarting the app.
+    const revision = ++state.revision;
+    state.browsing = true;
+    state.openingFavorite = true;
+    state.cancelling = false;
+    state.scanPath = favorite.path;
+    state.message = null;
+    app.setAnalysisBusy(true);
+    render();
+    let opened = false;
+    try {
+      const report = await invoke('open_favorite_directory', { favoriteId });
+      if (revision !== state.revision || favoriteRevision !== state.favoriteRevision || state.cancelling) return false;
+      if (!validReport(report) || report.root.kind !== 'directory' || report.root.path !== favorite.path) throw new Error('收藏目录结果格式无效。');
+      if (report.cancelled) return false;
+      if (listingFailed(report)) throw new Error(Number(report.permissionDeniedCount) > 0 ? '目录访问权限不足。' : '目录暂时无法读取。');
+      commitBrowse([], report);
+      opened = true;
+    } catch (error) {
+      if (revision === state.revision && favoriteRevision === state.favoriteRevision) {
+        const text = errorText(error).startsWith('FAVORITE_MISSING:') || invalidStatus(error) ? '这个收藏目录已被移动或删除。收藏仍保留，可从侧栏移除。' : friendlyFailure(error, '打开收藏目录');
+        favorites.note(text);
+        message('info', text);
+      }
+    } finally {
+      if (revision === state.revision) { state.browsing = false; state.openingFavorite = false; state.cancelling = false; app.setAnalysisBusy(false); if (!opened) restoreView(); render(); }
+    }
+    return opened && favoriteRevision === state.favoriteRevision;
   }
   async function reveal(node = current()?.node) {
     const entry = current();
@@ -671,6 +758,7 @@
     catch (error) { message('error', `无法打开系统设置：${errorText(error)}。请按“更多”中的路径手动打开。`); }
   }
   function bind() {
+    $('analysis-favorite')?.addEventListener('click', () => toggleFavorite());
     $('analysis-permissions').addEventListener('click', openPrivacySettings);
     $('analysis-chart-toggle').addEventListener('click', () => { state.showChart = !state.showChart; closeOptions(true); render(); });
     $('analysis-details-toggle').addEventListener('click', () => { state.showDetails = !state.showDetails; closeOptions(true); render(); });
@@ -683,6 +771,8 @@
     $('check-cleanup-suggestions').addEventListener('click', () => { if (!app.isBusy()) app.showCleanupAndScan(); });
     $('analysis-breadcrumbs').addEventListener('click', (event) => { const button = event.target.closest('[data-history-index]'); if (button) goBack(Number(button.dataset.historyIndex)); });
     $('analysis-view').addEventListener('click', (event) => {
+      const favoriteButton = event.target.closest('[data-analysis-favorite]');
+      if (favoriteButton) { event.preventDefault(); event.stopPropagation(); toggleFavorite(findNode(favoriteButton.dataset.analysisFavorite)); return; }
       const accountingButton = event.target.closest('[data-analysis-accounting]');
       if (accountingButton) { $('analysis-options').open = true; $('analysis-storage-info').open = true; $('analysis-storage-info').querySelector('summary').focus(); return; }
       const cancelButton = event.target.closest('[data-analysis-cancel]');
@@ -697,6 +787,7 @@
     document.addEventListener('click', (event) => { if (!event.target.closest('#analysis-options, [data-analysis-accounting], #analysis-permissions')) closeOptions(); });
     document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && $('analysis-options').open) closeOptions(true); });
     window.addEventListener('mac-sweep-view', () => render());
+    window.addEventListener('mac-sweep-favorites', () => render());
     window.addEventListener('resize', alignBreadcrumbs);
     window.addEventListener('beforeunload', stopProgressTimer);
   }
@@ -734,6 +825,6 @@
     }
     render();
   }
-  window.macSweepAnalyzer = { scan: () => scanDirectory(), cancel };
+  window.macSweepAnalyzer = { scan: () => scanDirectory(), cancel, openFavorite };
   init();
 })();

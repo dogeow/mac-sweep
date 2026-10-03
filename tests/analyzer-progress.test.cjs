@@ -7,11 +7,15 @@ const navigation = require('../frontend/analysis-navigation.js');
 
 // Drive the real analyzer with deferred native replies and a controlled clock.
 // This checks async lifetime and truthful progress, without relying on a disk scan.
-async function harness() {
+async function harness(options = {}) {
   let now = 0;
   let busy = false;
   let timerId = 0;
   let progressListener;
+  let view = options.view || 'analysis';
+  const favoriteList = (options.favorites || []).map((favorite) => ({ ...favorite }));
+  const favoriteCalls = [];
+  const favoriteNotices = [];
   const timers = new Map();
   const windowListeners = new Map();
   const pending = [];
@@ -67,7 +71,9 @@ async function harness() {
   }
   document.getElementById = (id) => elements.get(id) || null;
   const app = {
-    desktop: true, demo: false, getView: () => 'analysis', isBusy: () => busy,
+    desktop: true, demo: false, getView: () => view, isBusy: () => busy,
+    showAnalysis: () => { if (busy) return false; view = 'analysis'; windowListeners.get('mac-sweep-view')?.(); return true; },
+    showHome: () => { if (busy) return false; view = 'home'; windowListeners.get('mac-sweep-view')?.(); return true; },
     setAnalysisBusy: (value) => { busy = value; },
     icon: () => '', escapeHtml: (value) => String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('"', '&quot;'),
   };
@@ -87,17 +93,24 @@ async function harness() {
           if (result instanceof Error) throw result;
           return Promise.resolve(result);
         }
-        if (command === 'analyze_directory' || command === 'browse_analysis_directory') return new Promise((resolve, reject) => pending.push({ command, args, resolve, reject }));
+        if (command === 'analyze_directory' || command === 'browse_analysis_directory' || command === 'resolve_favorite_directory' || command === 'open_favorite_directory') return new Promise((resolve, reject) => pending.push({ command, args, resolve, reject }));
         throw new Error(`Unexpected native command: ${command}`);
       } },
       event: { listen: (_, listener) => { progressListener = listener; return Promise.resolve(() => {}); } },
     },
   };
+  if (options.favorites) window.macSweepFavorites = {
+    has: (path) => favoriteList.some((favorite) => favorite.path === path),
+    get: (id) => favoriteList.find((favorite) => favorite.id === id) || null,
+    isBusy: () => false, canEdit: () => !options.readOnlyFavorites,
+    icon: (filled) => filled ? '★' : '☆', setCurrent: () => {}, note: (text) => favoriteNotices.push(text),
+    toggle: async (args) => { favoriteCalls.push(args); },
+  };
   const source = fs.readFileSync(path.join(__dirname, '../frontend/analyzer.js'), 'utf8');
   vm.runInNewContext(source, { window, document, performance: { now: () => now } });
   await new Promise(setImmediate);
   return {
-    elements, timers, pending, calls, app: window.macSweepAnalyzer,
+    elements, timers, pending, calls, favoriteCalls, favoriteNotices, app: window.macSweepAnalyzer, getView: () => view,
     emit: (payload) => progressListener({ payload }),
     tick: (milliseconds) => { now += milliseconds; for (const callback of [...timers.values()]) callback(); },
     unload: () => windowListeners.get('beforeunload')(),
@@ -579,4 +592,115 @@ test('recovery visits each invalid ancestor at most once and stops when all are 
   assert.deepEqual(attempts.map((call) => call.args.nodeId), ['folder', 'root']);
   assert.equal(h.elements.get('start-scan').disabled, true);
   assert.equal(h.timers.size, 0);
+});
+
+test('favorite navigation reuses history and shallow tree browsing instead of scanning everything again', async () => {
+  const library = node({ id: 'library', path: '/example/Library', name: 'Library', hasChildren: true });
+  const h = await harness({ favorites: [{ id: 'favorite-library', path: library.path, name: 'Library' }] });
+  const scan = h.app.scan();
+  h.pending.shift().resolve(report({ root: node({ children: [library], hasChildren: true }) }));
+  await scan;
+  const first = h.app.openFavorite('favorite-library');
+  assert.equal(h.pending[0].command, 'browse_analysis_directory');
+  assert.equal(h.pending[0].args.nodeId, 'library');
+  h.pending.shift().resolve(report({ analysisId: 'library-browse', sourceAnalysisId: 'fixture', cachedBrowse: true, root: { ...library, hasChildren: false } }));
+  assert.equal(await first, true);
+  assertSelectedLocation(h, library.path);
+  h.back();
+  await h.clickNode('library');
+  assert.equal(h.pending.length, 0);
+  const requests = h.calls.length;
+  assert.equal(await h.app.openFavorite('favorite-library'), true);
+  assert.equal(h.calls.length, requests + 1);
+  assert.equal(h.calls.at(-1).command, 'inspect_analysis_node');
+  assert.equal(h.calls.filter((call) => call.command === 'analyze_directory').length, 1);
+  assert.equal(h.calls.filter((call) => call.command === 'resolve_favorite_directory').length, 0);
+});
+
+test('a first favorite visit from home opens only its immediate contents, and full analysis requires the next explicit action', async () => {
+  const favorite = { id: 'favorite-documents', path: '/example/Documents', name: 'Documents' };
+  const h = await harness({ favorites: [favorite], view: 'home' });
+  const open = h.app.openFavorite(favorite.id);
+  assert.equal(h.pending[0].command, 'open_favorite_directory');
+  assert.deepEqual(Object.keys(h.pending[0].args), ['favoriteId']);
+  assert.equal(h.pending[0].args.favoriteId, favorite.id);
+  assert.equal(await h.app.openFavorite(favorite.id), false);
+  h.pending.shift().resolve(report({ analysisId: 'favorite-documents-open', cachedBrowse: true, root: node({ id: 'documents-open', path: favorite.path, name: favorite.name, bytes: 0, sizeKnown: false }) }));
+  assert.equal(await open, true);
+  assert.equal(h.calls.filter((call) => call.command === 'analyze_directory').length, 0);
+  assert.equal(h.elements.get('scan-button-text').textContent, '完整分析');
+  const full = h.app.scan();
+  assert.equal(h.pending[0].command, 'analyze_directory');
+  assert.equal(h.pending[0].args.path, favorite.path);
+  h.pending.shift().resolve(report({ analysisId: 'documents-analysis', root: node({ id: 'documents', path: favorite.path, name: favorite.name }) }));
+  await full;
+  assertSelectedLocation(h, favorite.path);
+});
+
+test('a missing favorite stays registered, while resolve failures and cancellation cannot trigger an analysis', async () => {
+  const favorite = { id: 'favorite-missing', path: '/example/missing', name: 'missing' };
+  const h = await harness({ favorites: [favorite], readOnlyFavorites: true });
+  const missing = h.app.openFavorite(favorite.id);
+  h.pending.shift().reject('FAVORITE_MISSING: /example/missing does not exist');
+  assert.equal(await missing, false);
+  assert.match(h.favoriteNotices.at(-1), /收藏仍保留.*侧栏移除/);
+  assert.equal(h.favoriteNotices.at(-1).includes('/example'), false);
+  assert.equal(h.calls.filter((call) => call.command === 'analyze_directory').length, 0);
+  const cancelled = h.app.openFavorite(favorite.id);
+  const reply = h.pending.shift();
+  await h.app.cancel();
+  reply.resolve(report({ cachedBrowse: true, root: node({ path: favorite.path, name: favorite.name, bytes: 0, sizeKnown: false }) }));
+  assert.equal(await cancelled, false);
+  assert.equal(h.calls.filter((call) => call.command === 'analyze_directory').length, 0);
+  const denied = h.app.openFavorite(favorite.id);
+  h.pending.shift().reject(new Error('Permission denied /example/missing'));
+  assert.equal(await denied, false);
+  assert.match(h.favoriteNotices.at(-1), /访问权限/);
+  assert.equal(h.favoriteNotices.at(-1).includes('删除'), false);
+});
+
+test('directory star actions pass registered IDs and do not navigate or star file rows', async () => {
+  const h = await harness({ favorites: [] });
+  const folder = node({ id: 'folder', path: '/example/folder', name: 'folder' });
+  const file = node({ id: 'file', path: '/example/file.txt', name: 'file.txt', kind: 'file' });
+  const scan = h.app.scan();
+  h.pending.shift().resolve(report({ root: node({ children: [folder, file], hasChildren: true }) }));
+  await scan;
+  const requests = h.calls.length;
+  const clickStar = (id) => h.elements.get('analysis-view').listeners.get('click')({ preventDefault() {}, stopPropagation() {}, target: { closest: (selector) => selector === '[data-analysis-favorite]' ? { dataset: { analysisFavorite: id } } : null } });
+  clickStar('folder');
+  await h.settle();
+  assert.equal(h.favoriteCalls.length, 1);
+  assert.equal(h.favoriteCalls[0].analysisId, 'fixture');
+  assert.equal(h.favoriteCalls[0].nodeId, 'folder');
+  assertSelectedLocation(h, '/example');
+  assert.equal(h.calls.length, requests);
+  clickStar('file');
+  await h.settle();
+  assert.equal(h.favoriteCalls.length, 1);
+  assert.equal(h.elements.get('analysis-rows').innerHTML.includes('data-analysis-favorite="file"'), false);
+});
+
+test('expired favorite history falls back to an ID-based shallow open, and failed first opens restore home', async () => {
+  const favorite = { id: 'favorite-root', path: '/example', name: 'example' };
+  const h = await harness({ favorites: [favorite] });
+  const scan = h.app.scan();
+  h.pending.shift().resolve(report());
+  await scan;
+  h.queueInspect(new Error('此分析结果已过期'));
+  const open = h.app.openFavorite(favorite.id);
+  await h.settle();
+  assert.equal(h.pending[0].command, 'open_favorite_directory');
+  assert.equal(h.pending[0].args.favoriteId, favorite.id);
+  h.pending.shift().resolve(report({ analysisId: 'favorite-new-root', cachedBrowse: true, root: node({ id: 'new-root', bytes: 0, sizeKnown: false }) }));
+  assert.equal(await open, true);
+  assert.equal(h.calls.filter((call) => call.command === 'analyze_directory').length, 1);
+  const home = await harness({ favorites: [favorite], view: 'home' });
+  const denied = home.app.openFavorite(favorite.id);
+  home.pending.shift().reject('Permission denied at /example');
+  assert.equal(await denied, false);
+  assert.equal(home.getView(), 'home');
+  assert.match(home.favoriteNotices.at(-1), /访问权限/);
+  assert.equal(home.pending.length, 0);
+  assert.equal(home.calls.some((call) => call.command === 'analyze_directory'), false);
 });

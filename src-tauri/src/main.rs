@@ -4,6 +4,7 @@ mod analysis_cache;
 mod analysis_entry;
 mod analyzer;
 mod disk;
+mod favorites;
 mod finder;
 mod scanner;
 
@@ -278,6 +279,125 @@ fn recorded_analysis_entry(
         device,
         inode,
     ))
+}
+
+#[tauri::command]
+async fn get_favorite_directories(
+    app: tauri::AppHandle,
+) -> Result<favorites::FavoritesList, String> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| "无法读取收藏存储位置。")?;
+    tauri::async_runtime::spawn_blocking(move || favorites::get(&data_dir))
+        .await
+        .map_err(|_| "收藏列表读取未完成，请稍后重试。".into())
+}
+
+#[tauri::command]
+async fn add_favorite_directory(
+    app: tauri::AppHandle,
+    state: State<'_, CleanerState>,
+    analysis_id: String,
+    node_id: String,
+) -> Result<favorites::FavoritesList, String> {
+    let (path, source_root, device, inode) = {
+        let session = state.session.lock().map_err(|_| "分析状态不可用。")?;
+        recorded_favorite_directory(&session, &analysis_id, &node_id)?
+    };
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| "无法读取收藏存储位置。")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        favorites::add_recorded(&data_dir, &path, &source_root, device, inode)
+    })
+    .await
+    .map_err(|_| "目录收藏未完成，请稍后重试。")?
+}
+
+fn recorded_favorite_directory(
+    session: &Session,
+    analysis_id: &str,
+    node_id: &str,
+) -> Result<(PathBuf, PathBuf, u64, u64), String> {
+    let report = session
+        .analyses
+        .iter()
+        .find(|report| report.analysis_id == analysis_id)
+        .ok_or("此分析结果已过期，请重新分析后收藏。")?;
+    if find_node(&report.root, node_id).is_none_or(|node| node.kind != "directory") {
+        return Err("只能收藏当前分析结果中的文件夹。".into());
+    }
+    recorded_analysis_entry(session, analysis_id, node_id)
+}
+
+#[tauri::command]
+async fn remove_favorite_directory(
+    app: tauri::AppHandle,
+    favorite_id: String,
+) -> Result<favorites::FavoritesList, String> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| "无法读取收藏存储位置。")?;
+    tauri::async_runtime::spawn_blocking(move || favorites::remove(&data_dir, &favorite_id))
+        .await
+        .map_err(|_| "收藏移除未完成，请稍后重试。")?
+}
+
+#[tauri::command]
+async fn resolve_favorite_directory(
+    app: tauri::AppHandle,
+    favorite_id: String,
+) -> Result<Value, String> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| "无法读取收藏存储位置。")?;
+    let favorite =
+        tauri::async_runtime::spawn_blocking(move || favorites::resolve(&data_dir, &favorite_id))
+            .await
+            .map_err(|_| "收藏目录检查未完成，请稍后重试。")??;
+    Ok(serde_json::json!({ "favorite": favorite }))
+}
+
+#[tauri::command]
+async fn open_favorite_directory(
+    app: tauri::AppHandle,
+    state: State<'_, CleanerState>,
+    favorite_id: String,
+) -> Result<Value, String> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| "无法读取收藏存储位置。")?;
+    let session = state.session.clone();
+    let cancel = state.cancel.clone();
+    {
+        let mut guard = session.lock().map_err(|_| "目录浏览状态不可用。")?;
+        if guard.operation != Operation::Idle {
+            return Err("请先等待当前操作完成。".into());
+        }
+        guard.operation = Operation::Browsing;
+        cancel.store(false, Ordering::Release);
+    }
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let favorite = favorites::resolve(&data_dir, &favorite_id)?;
+        analyzer::browse_location(PathBuf::from(favorite.path).as_path(), &cancel)
+    })
+    .await;
+    let mut guard = session.lock().map_err(|_| "目录浏览状态不可用。")?;
+    guard.operation = Operation::Idle;
+    match result {
+        Ok(Ok(report)) => {
+            let value = serde_json::to_value(&report).map_err(|_| "目录结果无法显示。")?;
+            guard.register_analysis(report);
+            Ok(value)
+        }
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err("收藏目录打开未完成，请稍后重试。".into()),
+    }
 }
 
 #[tauri::command]
@@ -654,6 +774,11 @@ fn main() {
             analyze_directory,
             browse_analysis_directory,
             inspect_analysis_node,
+            get_favorite_directories,
+            add_favorite_directory,
+            remove_favorite_directory,
+            resolve_favorite_directory,
+            open_favorite_directory,
             cancel_analysis,
             reveal_analysis_node,
             open_privacy_settings
@@ -690,4 +815,35 @@ fn main() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod favorite_command_tests {
+    use super::*;
+    static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+    #[test]
+    fn favorite_addition_requires_registered_directory_ids_and_allows_the_analysis_root() {
+        let path = std::env::temp_dir().join(format!(
+            "mac-sweep-favorite-command-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("file.bin"), b"temporary fixture").unwrap();
+        let report = analyzer::analyze(&path, &AtomicBool::new(false), |_| {}).unwrap();
+        let id = report.analysis_id.clone();
+        let root_id = report.root.id.clone();
+        let file_id = report.root.children[0].id.clone();
+        let session = Session {
+            operation: Operation::Idle,
+            snapshot: None,
+            analyses: VecDeque::from([report]),
+        };
+        assert!(recorded_favorite_directory(&session, &id, &root_id).is_ok());
+        assert!(recorded_favorite_directory(&session, "stale-analysis-id", &root_id).is_err());
+        assert!(recorded_favorite_directory(&session, &id, "not-a-recorded-node").is_err());
+        assert!(recorded_favorite_directory(&session, &id, &file_id).is_err());
+        std::fs::remove_dir_all(path).unwrap();
+    }
 }

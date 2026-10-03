@@ -5,7 +5,7 @@
 use crate::analysis_cache::{BoundedDirectorySummaries, DirectorySummary, DirectorySummaryIndex};
 use serde::Serialize;
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
 use std::io;
@@ -483,6 +483,52 @@ pub fn browse(
         measured_at: index.measured_at,
         summary_index: index,
     })
+}
+
+/// A persisted favorite is an authorized location, not a previously measured
+/// tree. Open its immediate entries with unknown folder totals, never recurse.
+pub fn browse_location(path: &Path, cancel: &AtomicBool) -> Result<AnalysisReport, String> {
+    let canonical = path.canonicalize().map_err(browse_path_error)?;
+    let metadata = fs::symlink_metadata(path).map_err(browse_path_error)?;
+    if canonical != path || !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("ANALYSIS_NODE_CHANGED:此目录已变化，请重新分析。".into());
+    }
+    let source_id = format!(
+        "location-{}-{}",
+        std::process::id(),
+        NEXT_ANALYSIS.fetch_add(1, Ordering::Relaxed)
+    );
+    let root = DirectoryNode {
+        id: format!("{source_id}-root"),
+        path: canonical
+            .to_str()
+            .ok_or("这个目录名称无法打开。")?
+            .to_owned(),
+        name: canonical
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "/".into()),
+        kind: "directory".into(),
+        bytes: 0,
+        files: 0,
+        dirs: 1,
+        children: Vec::new(),
+        has_children: true,
+        partial: true,
+        omitted_children: 0,
+        size_known: false,
+        size_source: "unknown".into(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    };
+    let index = Arc::new(DirectorySummaryIndex {
+        source_analysis_id: source_id,
+        root: root.path.clone(),
+        device: metadata.dev(),
+        measured_at: 0,
+        entries: HashMap::new(),
+    });
+    browse(root, index, 0, 0, cancel)
 }
 
 struct Context<'a, F: Fn(AnalysisProgress)> {
@@ -2055,5 +2101,33 @@ mod tests {
             browse_path_error(io::Error::from_raw_os_error(libc::ENOTDIR))
                 .starts_with("ANALYSIS_NODE_CHANGED:")
         );
+    }
+
+    #[test]
+    fn fresh_favorite_locations_open_direct_entries_without_a_recursive_analysis() {
+        let fixture = Fixture::new();
+        fixture.file("folder/deep/never-recursed.bin", 32_768);
+        fixture.file("direct.bin", 4_096);
+        let opened = browse_location(&fixture.0, &AtomicBool::new(false)).unwrap();
+        assert!(opened.cached_browse);
+        assert!(!opened.root.size_known);
+        assert_eq!(opened.root.size_source, "unknown");
+        assert_eq!(opened.measured_at, 0);
+        assert_eq!(opened.summary_index.len(), 0);
+        assert_eq!(opened.scanned_files, 1);
+        assert_eq!(opened.root.children.len(), 2);
+        let folder = opened
+            .root
+            .children
+            .iter()
+            .find(|node| node.name == "folder")
+            .unwrap();
+        assert!(!folder.size_known);
+        assert!(folder.children.is_empty());
+        assert!(directory_for_browse(&opened, &folder.id).is_ok());
+        let cancelled = browse_location(&fixture.0, &AtomicBool::new(true)).unwrap();
+        assert!(cancelled.cancelled);
+        assert!(cancelled.root.children.is_empty());
+        assert!(fixture.0.join("folder/deep/never-recursed.bin").exists());
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "mac-sweep"
-version = "0.1.4"
+version = "0.1.5"
 description = "Read-only macOS disk analysis and recoverable cleanup"
 edition = "2021"
 rust-version = "1.90"
