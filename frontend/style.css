@@ -352,6 +352,28 @@ dialog::backdrop { background: #00000028; }
 .analysis-demo { padding: 8px 20px; font-size: 11px; background: var(--warning-bg); color: var(--warning); border-bottom: 1px solid var(--hairline); flex-shrink: 0; }
 .analysis-progress { display: flex; align-items: center; gap: 9px; min-height: 36px; flex-shrink: 0; background: var(--bg); padding: 7px 18px; border-bottom: 1px solid var(--hairline); }
 .analysis-progress > div { flex: 1; min-width: 0; }
+.analysis-meter { width: 100%; min-width: 0; }
+.analysis-meter-label { display: block; color: var(--secondary); font-size: 12px; font-variant-numeric: tabular-nums; margin-bottom: 7px; }
+.analysis-meter-track { height: 7px; overflow: hidden; border-radius: 5px; background: var(--disk-track); }
+.analysis-meter-fill { height: 100%; border-radius: inherit; background: var(--accent); transition: width .35s ease-out; position: relative; overflow: hidden; }
+.analysis-meter-fill::after { content: ''; position: absolute; inset: 0; background: linear-gradient(110deg, transparent 25%, #ffffff40 50%, transparent 75%); background-size: 130px 100%; animation: analysis-meter-shimmer 1.5s linear infinite; }
+.analysis-empty-meter { width: min(360px, 85%); margin: 20px 0 3px; }
+.analysis-empty-meter .analysis-meter-label { font-size: 13px; }
+.analysis-progress .analysis-meter { max-width: 230px; margin-top: 8px; }
+.analysis-progress .analysis-meter-label { font-size: 10px; margin-bottom: 5px; }
+.analysis-meter.is-indeterminate .analysis-meter-fill { width: 30%; animation: analysis-meter-indeterminate 1.6s ease-in-out infinite; }
+@keyframes analysis-meter-shimmer { to { background-position: 130px 0; } }
+@keyframes analysis-meter-indeterminate { 0% { transform: translateX(-100%); } 100% { transform: translateX(340%); } }
+.analysis-context-menu { position: fixed; z-index: 120; min-width: 175px; max-width: calc(100vw - 16px); padding: 5px; border: 1px solid var(--border); border-radius: 8px; background: var(--toolbar); box-shadow: 0 7px 24px #00000035; }
+.analysis-context-menu button { display: block; width: 100%; min-height: 29px; padding: 6px 10px; border-radius: 4px; text-align: left; background: transparent; color: var(--text); font-size: 12px; }
+.analysis-context-menu button:hover:not(:disabled), .analysis-context-menu button:focus-visible { background: var(--accent); color: #fff; outline: none; }
+.analysis-trash-path { display: block; margin-top: 10px; font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; color: var(--secondary); max-height: 120px; overflow: auto; user-select: text; }
+#analysis-trash-dialog p { font-size: 12px; line-height: 1.7; color: var(--secondary); }
+#analysis-trash-status { color: var(--warning); }
+@media (prefers-reduced-motion: reduce) {
+  .analysis-meter-fill { transition: none; }
+  .analysis-meter-fill::after, .analysis-meter.is-indeterminate .analysis-meter-fill { animation: none; }
+}
 .analysis-progress strong { display: block; font-weight: 400; font-size: 11px; color: var(--secondary); }
 .analysis-progress > div > span { display: block; font-size: 10px; color: var(--muted); margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .analysis-progress > span:not(.progress-spinner) { font-size: 11px; color: var(--muted); white-space: nowrap; }

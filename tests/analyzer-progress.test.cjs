@@ -61,6 +61,7 @@ async function harness(options = {}) {
     }
     querySelectorAll() { return []; }
     setAttribute(name, value) { this[name] = String(value); }
+    removeAttribute(name) { delete this[name]; }
     addEventListener(name, listener) { this.listeners.set(name, listener); }
     focus() { document.activeElement = this; }
   }
@@ -134,23 +135,42 @@ function assertSelectedLocation(h, expected) {
   assert.equal(h.elements.get('analysis-selected-path').title, expected);
 }
 
-test('live values stay truthful while elapsed time advances without events or cancel focus loss', async () => {
+test('event-based estimated progress stays truthful while elapsed time advances without filenames or cancel focus loss', async () => {
   const h = await harness();
   const scan = h.app.scan();
   const empty = h.elements.get('analysis-empty');
   assert.equal(h.timers.size, 1);
   assert.match(empty.querySelector('.analysis-empty-title').textContent, /正在完整分析我的文件/);
   assert.match(empty.querySelector('.analysis-empty-progress').textContent, /0 个文件/);
+  const meter = empty.querySelector('.analysis-empty-meter');
+  const label = empty.querySelector('.analysis-meter-label');
+  const track = empty.querySelector('.analysis-meter-track');
+  const fill = empty.querySelector('.analysis-meter-fill');
+  assert.equal(meter.classList.contains('is-indeterminate'), true);
+  assert.equal(label.textContent, '准备中');
+  assert.equal(Object.hasOwn(track, 'aria-valuenow'), false);
   const cancelButton = empty.querySelector('[data-analysis-cancel]');
   cancelButton.focus();
   const writes = empty.writes;
-  h.emit({ scannedFiles: 1234, bytesFound: 3000, currentPath: '/example/Documents/readme.txt' });
+  h.emit({ scannedFiles: 1234, bytesFound: 3000, currentPath: '/example/Documents/readme.txt', estimatedPercent: 37.5 });
   assert.match(empty.querySelector('.analysis-empty-progress').textContent, /1,234 个文件.*3 KB/);
-  assert.equal(empty.querySelector('.analysis-empty-location').textContent, '正在读取：readme.txt');
-  assert.equal(empty.querySelector('.analysis-empty-location').title, '/example/Documents/readme.txt');
+  assert.equal(empty.querySelector('.analysis-empty-location'), null);
+  assert.equal(h.elements.get('analysis-progress-path').textContent, '');
+  assert.equal(h.elements.get('analysis-progress-path').title, '');
+  assert.equal(label.textContent, '预计 38%');
+  assert.equal(track['aria-valuenow'], '37.5');
+  assert.equal(track['aria-valuemin'], '0');
+  assert.equal(track['aria-valuemax'], '100');
+  assert.equal(fill.style.width, '37.5%');
+  assert.equal(meter.classList.contains('is-indeterminate'), false);
+  h.elements.get('analysis-details-toggle').listeners.get('click')();
+  assert.equal(empty.querySelector('.analysis-empty-location'), null);
+  assert.equal(h.elements.get('analysis-progress-path').title, '');
   const realValues = empty.querySelector('.analysis-empty-progress').textContent;
   h.emit({ currentPath: '/example/cache', scannedFiles: NaN, bytesFound: -1 });
   assert.equal(empty.querySelector('.analysis-empty-progress').textContent, realValues);
+  assert.equal(label.textContent, '预计 38%');
+  assert.equal(fill.style.width, '37.5%');
   h.tick(5000);
   assert.match(empty.querySelector('.analysis-empty-time').textContent, /已用 5 秒.*等待系统返回/);
   assert.equal(empty.querySelector('.analysis-empty-progress').textContent, realValues);
@@ -161,6 +181,84 @@ test('live values stay truthful while elapsed time advances without events or ca
   assert.equal(h.timers.size, 0);
   h.emit({ scannedFiles: 9999, bytesFound: 9999 });
   assert.match(h.elements.get('analysis-progress-count').textContent, /1,234/);
+});
+
+test('unknown estimates remain indeterminate and invalid event percentages cannot announce completion', async () => {
+  const h = await harness();
+  const scan = h.app.scan();
+  const empty = h.elements.get('analysis-empty');
+  const wrapper = empty.querySelector('.analysis-empty-meter');
+  const label = empty.querySelector('.analysis-meter-label');
+  const track = empty.querySelector('.analysis-meter-track');
+  h.emit({ estimatedPercent: null, scannedFiles: 10, bytesFound: 3000, currentPath: '/example/secret.txt' });
+  h.tick(12000);
+  assert.equal(label.textContent, '准备中');
+  assert.equal(wrapper.classList.contains('is-indeterminate'), true);
+  assert.equal(Object.hasOwn(track, 'aria-valuenow'), false);
+  h.emit({ estimatedPercent: 42, scannedFiles: 20, bytesFound: 5000 });
+  for (const value of [100, 120, -1, NaN, '90']) h.emit({ estimatedPercent: value, scannedFiles: 21 });
+  assert.equal(label.textContent, '预计 42%');
+  assert.equal(track['aria-valuenow'], '42');
+  h.pending.shift().resolve({ analysisId: 'malformed', root: {} });
+  await scan;
+  assert.equal(label.textContent, '预计 42%');
+  h.emit({ estimatedPercent: 99, scannedFiles: 1000 });
+  assert.equal(track['aria-valuenow'], '42');
+});
+
+test('only a valid non-cancelled report reaches 100, while cancelled partial reports retain their estimate', async () => {
+  for (const cancelled of [false, true]) {
+    const h = await harness();
+    const scan = h.app.scan();
+    const empty = h.elements.get('analysis-empty');
+    const label = empty.querySelector('.analysis-meter-label');
+    const track = empty.querySelector('.analysis-meter-track');
+    h.emit({ estimatedPercent: 65, scannedFiles: 12, bytesFound: 9000 });
+    if (cancelled) await h.app.cancel();
+    h.pending.shift().resolve(report({ cancelled, root: node({ partial: true }), warnings: ['部分目录无权读取'] }));
+    await scan;
+    assert.equal(track['aria-valuenow'], cancelled ? '65' : '100');
+    assert.equal(label.textContent, cancelled ? '预计 65%' : '已完成 100%');
+    assert.equal(h.elements.get('analysis-warnings').classList.contains('hidden'), false);
+    h.emit({ estimatedPercent: 99 });
+    assert.equal(track['aria-valuenow'], cancelled ? '65' : '100');
+    assert.equal(h.timers.size, 0);
+  }
+});
+
+test('rescanning resets the finished meter, consumes real estimates, and hides it during directory browsing', async () => {
+  const h = await harness();
+  const child = node({ id: 'child', path: '/example/child', name: 'child' });
+  const scan = h.app.scan();
+  h.pending.shift().resolve(report({ root: node({ children: [child], hasChildren: true }) }));
+  await scan;
+  const wrapper = h.elements.get('analysis-progress-meter');
+  const label = h.elements.get('analysis-progress-percent');
+  const track = h.elements.get('analysis-progress-track');
+  const fill = h.elements.get('analysis-progress-fill');
+  assert.equal(label.textContent, '已完成 100%');
+  const rescan = h.app.scan();
+  assert.equal(wrapper.classList.contains('hidden'), false);
+  assert.equal(wrapper.classList.contains('is-indeterminate'), true);
+  assert.equal(label.textContent, '准备中');
+  assert.equal(Object.hasOwn(track, 'aria-valuenow'), false);
+  h.emit({ estimatedPercent: 0, scannedFiles: 0, bytesFound: 0 });
+  assert.equal(label.textContent, '预计 0%');
+  assert.equal(fill.style.width, '0%');
+  h.emit({ estimatedPercent: 64.3, scannedFiles: 10, bytesFound: 8192 });
+  h.tick(4000);
+  assert.equal(track['aria-valuenow'], '64.3');
+  assert.equal(fill.style.width, '64.3%');
+  h.pending.shift().resolve(report({ root: node({ children: [child], hasChildren: true }) }));
+  await rescan;
+  let reply;
+  h.queueInspect(new Promise((resolve) => { reply = resolve; }));
+  await h.clickNode('child');
+  assert.equal(wrapper.classList.contains('hidden'), true);
+  assert.equal(label.textContent, '');
+  assert.equal(Object.hasOwn(track, 'aria-valuenow'), false);
+  reply({ status: 'ready' });
+  await h.settle();
 });
 
 test('refresh keeps prior data, resets counters, and clears timers on rejected or malformed replies', async () => {

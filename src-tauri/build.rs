@@ -20,6 +20,7 @@ fn main() {
             "open_favorite_directory",
             "cancel_analysis",
             "reveal_analysis_node",
+            "trash_analysis_node",
             "open_privacy_settings",
         ]),
     ))

@@ -2,10 +2,12 @@
 
 mod analysis_cache;
 mod analysis_entry;
+mod analysis_trash;
 mod analyzer;
 mod disk;
 mod favorites;
 mod finder;
+mod macos_bulk;
 mod scanner;
 
 use scanner::{ScanOptions, ScanSnapshot};
@@ -445,6 +447,9 @@ async fn reveal_analysis_node(
         analysis_entry::EntryState::Changed => Ok(serde_json::json!({"status":"changed"})),
         analysis_entry::EntryState::Ready => match finder::reveal(app, path.clone()).await {
             Ok(()) => Ok(serde_json::json!({"status":"shown"})),
+            Err(error) if error.starts_with("已请求打开 Finder") => Ok(serde_json::json!({
+                "status":"shown", "warning":"已在 Finder 中定位。若窗口没有切到前台，请点击 Dock 中的 Finder。"
+            })),
             Err(_) => {
                 // A file may disappear between validation and Finder's request.
                 let latest = tauri::async_runtime::spawn_blocking(move || {
@@ -466,6 +471,32 @@ async fn reveal_analysis_node(
             }
         },
     }
+}
+
+#[tauri::command]
+async fn trash_analysis_node(
+    state: State<'_, CleanerState>,
+    analysis_id: String,
+    node_id: String,
+) -> Result<Value, String> {
+    let session = state.session.clone();
+    let home = state.home.clone();
+    let (path, root, device, inode) = {
+        let mut guard = session.lock().map_err(|_| "分析状态不可用。")?;
+        if guard.operation != Operation::Idle {
+            return Err("请先等待当前操作完成。".into());
+        }
+        let entry = recorded_analysis_entry(&guard, &analysis_id, &node_id)?;
+        guard.operation = Operation::Cleaning;
+        entry
+    };
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        analysis_trash::move_verified(&path, &root, &home, device, inode, scanner::native_trash)
+    })
+    .await;
+    session.lock().map_err(|_| "分析状态不可用。")?.operation = Operation::Idle;
+    let status = result.map_err(|_| "移动结果未确认，请在 Finder 检查文件状态。")??;
+    Ok(serde_json::json!({"status":status}))
 }
 
 #[tauri::command]
@@ -781,6 +812,7 @@ fn main() {
             open_favorite_directory,
             cancel_analysis,
             reveal_analysis_node,
+            trash_analysis_node,
             open_privacy_settings
         ])
         .on_menu_event(|app, event| {

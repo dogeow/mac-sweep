@@ -8,7 +8,7 @@
   const escape = app.escapeHtml;
   const icon = app.icon;
   const invoke = (command, args) => window.__TAURI__.core.invoke(command, args);
-  const state = { locations: [], path: '', history: [], revision: 0, favoriteRevision: 0, scanning: false, browsing: false, openingFavorite: false, recovering: false, cancelling: false, page: 1, sort: 'size-desc', chartNodes: new Map(), browseCache: new Map(), invalidatedNodes: new Map(), staleDirectories: new Map(), emptyReason: null, message: null, showChart: false, showDetails: false, scanPath: '', progress: null, scanStartedAt: 0, lastProgressAt: 0, progressTimer: null };
+  const state = { locations: [], path: '', history: [], revision: 0, favoriteRevision: 0, scanning: false, browsing: false, openingFavorite: false, recovering: false, cancelling: false, page: 1, sort: 'size-desc', chartNodes: new Map(), browseCache: new Map(), invalidatedNodes: new Map(), staleDirectories: new Map(), emptyReason: null, message: null, showChart: false, showDetails: false, scanPath: '', progress: null, estimatedPercent: null, scanStartedAt: 0, lastProgressAt: 0, progressTimer: null };
   const PAGE_SIZE = 100;
   const palette = ['#5b94ce', '#8b86c6', '#6aaa97', '#bf9167', '#b17eaa', '#829bb5', '#a39a6a', '#7188b9', '#ba8d85', '#8eaa78', '#8398a2', '#a29bb8'];
   const formatBytes = (value) => {
@@ -240,40 +240,57 @@
     $('analysis-chart-key').innerHTML = legends.slice(0, 7).join('') + (legends.length > 7 ? `<span class="chart-more">另有 ${legends.length - 7} 项，可在右侧列表查看</span>` : '');
     $('analysis-chart-caption').textContent = !sizeKnown(node) ? '此目录尚无大小统计，可以选择完整分析。' : hasUnknownChildren ? '部分子目录尚无大小统计，可以选择完整分析。' : accounting ? accounting.differentMeasurement ? '文件夹块统计可能重复包含共享块，与系统计量不同。' : '已定位文件的分布，不含其他 APFS 卷和未定位空间。' : node.partial ? '部分文件未读取，大小未统计完整。' : '点击色块，查看里面的文件夹。';
   }
+  function renderMeter(wrapper, label, track, fill) {
+    if (!wrapper || !label || !track || !fill) return;
+    const percent = state.estimatedPercent;
+    const indeterminate = percent === null;
+    wrapper.classList.toggle('is-indeterminate', indeterminate);
+    label.textContent = indeterminate ? '准备中' : percent === 100 ? '已完成 100%' : `预计 ${Math.round(percent)}%`;
+    track.setAttribute('role', 'progressbar');
+    track.setAttribute('aria-label', '目录分析进度');
+    track.setAttribute('aria-valuemin', '0');
+    track.setAttribute('aria-valuemax', '100');
+    track.setAttribute('aria-valuetext', label.textContent);
+    if (indeterminate) { track.removeAttribute('aria-valuenow'); fill.style.width = ''; }
+    else { track.setAttribute('aria-valuenow', String(percent)); fill.style.width = `${percent}%`; }
+  }
   function renderProgress() {
     const entry = current();
     $('analysis-progress').classList.toggle('hidden', (!state.scanning && !state.browsing) || !entry);
-    $('analysis-progress-path').classList.toggle('hidden', state.browsing);
+    $('analysis-progress-path').classList.add('hidden');
+    $('analysis-progress-path').textContent = '';
+    $('analysis-progress-path').title = '';
+    $('analysis-progress-path').setAttribute('aria-hidden', 'true');
     $('analysis-progress-count').classList.toggle('hidden', state.browsing);
+    $('analysis-progress-meter')?.classList.toggle('hidden', !state.scanning);
+    $('analysis-progress-meter')?.setAttribute('aria-hidden', String(!state.scanning));
+    if (!state.browsing) renderMeter($('analysis-progress-meter'), $('analysis-progress-percent'), $('analysis-progress-track'), $('analysis-progress-fill'));
+    else {
+      if ($('analysis-progress-percent')) $('analysis-progress-percent').textContent = '';
+      $('analysis-progress-track')?.removeAttribute('aria-valuenow');
+    }
     if (state.browsing) {
       $('analysis-progress-label').textContent = state.cancelling ? '正在停止打开目录…' : `${state.openingFavorite ? '正在打开收藏' : state.recovering ? '正在更新列表' : '正在打开目录'}：${friendlyPath(state.scanPath)}`;
       $('analysis-progress-count').textContent = '';
-      $('analysis-progress-path').textContent = '';
       if (state.openingFavorite && !entry) $('analysis-empty').innerHTML = `<span class="progress-spinner" aria-hidden="true"></span><strong>正在打开收藏目录…</strong><p>正在确认目录是否可用。</p><button class="text-button" data-analysis-cancel ${state.cancelling ? 'disabled' : ''}>${state.cancelling ? '取消中…' : '取消打开'}</button>`;
       return;
     }
     const progress = state.progress;
     const location = friendlyPath(state.scanPath || state.path);
-    const path = progress?.currentPath || state.scanPath || state.path;
     const elapsed = Math.max(0, Math.floor((performance.now() - state.scanStartedAt) / 1000));
     const waiting = state.scanning && performance.now() - state.lastProgressAt >= 3000;
     const activity = state.cancelling ? '等待系统停止' : waiting ? '继续统计，等待系统返回' : '正在统计';
     const elapsedText = `已用 ${elapsed.toLocaleString()} 秒 · ${activity}`;
     const countText = `已查看 ${Number(progress?.scannedFiles || 0).toLocaleString()} 个文件 · 已统计 ${formatBytes(progress?.bytesFound)}`;
-    const itemText = state.showDetails ? path : friendlyPath(path);
-    const currentText = `${state.cancelling ? '最后读取' : '正在读取'}：${itemText}`;
     $('analysis-progress-label').textContent = `${state.cancelling ? '正在停止完整分析' : '正在完整分析，以下是上次结果'} · ${elapsedText}`;
-    $('analysis-progress-path').textContent = currentText;
-    $('analysis-progress-path').title = path;
     $('analysis-progress-count').textContent = countText;
     if (state.scanning && !entry) {
       const empty = $('analysis-empty');
       // Keep the same cancel button while progress or the elapsed timer updates.
-      if (!empty.querySelector('[data-analysis-cancel]')) empty.innerHTML = '<span class="progress-spinner" aria-hidden="true"></span><strong class="analysis-empty-title"></strong><p class="analysis-empty-progress"></p><p class="analysis-empty-location"></p><p class="analysis-empty-time"></p><button class="text-button" data-analysis-cancel>停止分析</button>';
+      if (!empty.querySelector('.analysis-empty-meter')) empty.innerHTML = '<span class="progress-spinner" aria-hidden="true"></span><strong class="analysis-empty-title"></strong><div class="analysis-empty-meter analysis-meter"><span class="analysis-meter-label"></span><div class="analysis-meter-track"><div class="analysis-meter-fill"></div></div></div><p class="analysis-empty-progress"></p><p class="analysis-empty-time"></p><button class="text-button" data-analysis-cancel>停止分析</button>';
       empty.querySelector('.analysis-empty-title').textContent = state.cancelling ? '正在停止分析…' : `正在完整分析${location}`;
       empty.querySelector('.analysis-empty-progress').textContent = countText;
-      empty.querySelector('.analysis-empty-location').textContent = currentText;
-      empty.querySelector('.analysis-empty-location').title = path;
+      renderMeter(empty.querySelector('.analysis-empty-meter'), empty.querySelector('.analysis-meter-label'), empty.querySelector('.analysis-meter-track'), empty.querySelector('.analysis-meter-fill'));
       empty.querySelector('.analysis-empty-time').textContent = elapsedText;
       const cancelButton = empty.querySelector('[data-analysis-cancel]');
       cancelButton.disabled = state.cancelling;
@@ -387,7 +404,7 @@
       const caption = state.showDetails ? child.path : `${directory ? '打开' : '在 Finder 中显示'}${friendlyName(child)}`;
       const filled = directory && Boolean(favorites?.has(child.path));
       const favoriteAction = directory && favorites ? `<button class="analysis-favorite-action favorite-toggle${filled ? ' is-favorite' : ''}" data-analysis-favorite="${escape(child.id)}" aria-label="${filled ? '取消收藏' : '收藏'} ${escape(friendlyName(child))}" aria-pressed="${filled}" title="${filled ? '取消收藏' : '收藏目录'}" ${busy || !favorites.canEdit() || !app.desktop || app.demo ? 'disabled' : ''}>${favorites.icon(filled)}</button>` : '';
-      return `<tr><td><div class="analysis-name-cell"><button class="analysis-node-name" data-analysis-node="${escape(child.id)}" ${busy ? 'disabled' : ''} title="${escape(caption)}">${icon(directory ? 'folder' : 'file')}<span>${escape(friendlyName(child))}${subtitle}</span>${directory ? '<b>›</b>' : ''}</button>${favoriteAction}</div></td><td class="analysis-size">${sizeLabel(child)}</td><td class="analysis-percentage"><span>${knownProportion ? `${proportion < .1 && proportion > 0 ? '&lt;0.1' : proportion.toFixed(1)}%` : '待分析'}</span>${knownProportion ? `<i data-percent="${Math.min(100, proportion)}"></i>` : ''}</td><td class="analysis-file-count">${known ? Number(child.files || 0).toLocaleString() : '—'}</td><td class="analysis-more-action"><button class="row-reveal" data-analysis-reveal="${escape(child.id)}" title="在 Finder 中找到" aria-label="在 Finder 中找到 ${escape(child.name)}" ${busy || !app.desktop || app.demo ? 'disabled' : ''}>${icon('folder')}</button></td></tr>`;
+      return `<tr data-analysis-row="${escape(child.id)}"><td><div class="analysis-name-cell"><button class="analysis-node-name" data-analysis-node="${escape(child.id)}" ${busy ? 'disabled' : ''} title="${escape(caption)}">${icon(directory ? 'folder' : 'file')}<span>${escape(friendlyName(child))}${subtitle}</span>${directory ? '<b>›</b>' : ''}</button>${favoriteAction}</div></td><td class="analysis-size">${sizeLabel(child)}</td><td class="analysis-percentage"><span>${knownProportion ? `${proportion < .1 && proportion > 0 ? '&lt;0.1' : proportion.toFixed(1)}%` : '待分析'}</span>${knownProportion ? `<i data-percent="${Math.min(100, proportion)}"></i>` : ''}</td><td class="analysis-file-count">${known ? Number(child.files || 0).toLocaleString() : '—'}</td><td class="analysis-more-action"><button class="row-reveal" data-analysis-reveal="${escape(child.id)}" title="在 Finder 中找到" aria-label="在 Finder 中找到 ${escape(child.name)}" ${busy || !app.desktop || app.demo ? 'disabled' : ''}>${icon('folder')}</button></td></tr>`;
     }).join('') + (node.omittedChildren > 0 && state.page === pages ? `<tr class="analysis-omitted"><td>其他未展开项目<small>${Number(node.omittedChildren).toLocaleString()} 个子项</small></td><td class="analysis-size">${!sizeKnown(node) ? '待分析' : node.partial ? '未知' : formatBytes(omittedBytes)}</td><td colspan="3">${!sizeKnown(node) ? '目录大小尚未统计' : node.partial ? '已读取部分计入总占用；未读取占用未知' : '省略的显示项目已计入总占用'}</td></tr>` : '') + (state.page === pages ? accountingRows(accounting) : '');
     $('analysis-rows').querySelectorAll('[data-percent]').forEach((element) => { element.style.width = `${Number(element.dataset.percent) || 0}%`; });
     $('analysis-empty').classList.toggle('hidden', children.length > 0 || node.omittedChildren > 0 || hasAccountingRows);
@@ -432,6 +449,7 @@
     state.message = null;
     state.scanPath = path;
     state.progress = null;
+    state.estimatedPercent = null;
     startProgressTimer(revision);
     closeOptions();
     app.setAnalysisBusy(true);
@@ -440,6 +458,10 @@
       const report = await invoke('analyze_directory', { path });
       if (revision !== state.revision) return;
       if (!validReport(report)) throw new Error('目录分析结果格式无效。');
+      if (!report.cancelled) {
+        state.estimatedPercent = 100;
+        renderProgress();
+      }
       // Results opened from an older analysis must not survive a fresh source scan.
       state.browseCache.clear();
       const entry = { node: report.root, report, page: 1 };
@@ -710,12 +732,75 @@
     const selectedPath = state.path;
     try {
       const result = await invoke('reveal_analysis_node', { analysisId: entry.report.analysisId, nodeId: node.id });
+      if (result?.status === 'shown' && result.warning && current() === entry && revision === state.revision) message('info', '已在 Finder 中定位。若窗口没有切到前台，请点击 Dock 中的 Finder。');
       if (result?.status === 'missing' || result?.status === 'changed') {
         if (current() !== entry || revision !== state.revision || state.path !== selectedPath) { invalidateNode(node, entry.report); render(); return; }
         await recoverInvalidNode(node, entry.report, entry, result.status);
       }
     } catch (error) {
       if (current() === entry && revision === state.revision) message('error', friendlyFailure(error, '在 Finder 中显示'));
+    }
+  }
+  let trashDialogRequest = null;
+  function contextTarget(id) {
+    const entry = current(), node = findNode(id);
+    if (!entry || !node || !node.path || node.unavailable || !['directory', 'file', 'symlink'].includes(node.kind)) return null;
+    const home = state.locations.find(item => item.id === 'home')?.path;
+    const roots = home ? [home, `/System/Volumes/Data${home}`] : [];
+    const blocked = ['Library','Desktop','Documents','Downloads','Pictures','Music','Movies','Library/Preferences','Library/Containers','Library/Group Containers','Library/Application Support'];
+    const canTrash = roots.some(root => {
+      if (!node.path.startsWith(`${root}/`)) return false;
+      const relative = node.path.slice(root.length + 1).toLowerCase();
+      return !blocked.some(path => path.toLowerCase() === relative) && !['.Trash','.ssh','.gnupg','Library/Keychains'].some(path => relative === path.toLowerCase() || relative.startsWith(`${path.toLowerCase()}/`));
+    });
+    return { analysisId: entry.report.analysisId, nodeId: node.id, path: node.path, name: node.name, kind: node.kind, bytes: node.bytes, sizeKnown: sizeKnown(node), canTrash };
+  }
+  async function trashTarget(id) {
+    const target = contextTarget(id), entry = current(), node = findNode(id);
+    if (!target?.canTrash || app.isBusy() || trashDialogRequest) return false;
+    return new Promise(resolve => {
+      trashDialogRequest = { target, entry, node, resolve, moving: false };
+      $('analysis-trash-name').textContent = target.name;
+      $('analysis-trash-path').textContent = target.path;
+      $('analysis-trash-size').textContent = target.sizeKnown ? `已有统计：${formatBytes(target.bytes)}` : '目录大小尚未统计';
+      $('analysis-trash-scope').textContent = target.kind === 'directory' ? '会移动整个文件夹，包括尚未展开或统计的内容。' : '这个项目会移到废纸篓，可以在 Finder 中找回。';
+      $('analysis-trash-status').textContent = '';
+      $('analysis-trash-confirm').disabled = false;
+      $('analysis-trash-cancel').disabled = false;
+      app.setAnalysisBusy(true);
+      $('app-status').textContent = '等待移动确认';
+      $('analysis-status').textContent = '确认后，所选项目会移到废纸篓';
+      $('analysis-trash-dialog').showModal();
+      $('analysis-trash-cancel').focus();
+    });
+  }
+  function closeTrashDialog(result) {
+    const request = trashDialogRequest;
+    if (!request) return;
+    trashDialogRequest = null;
+    $('analysis-trash-dialog').close();
+    app.setAnalysisBusy(false);
+    render();
+    request.resolve(result);
+  }
+  async function confirmAnalysisTrash() {
+    const request = trashDialogRequest;
+    if (!request || request.moving) return;
+    request.moving = true;
+    $('analysis-trash-confirm').disabled = true;
+    $('analysis-trash-cancel').disabled = true;
+    $('analysis-trash-status').textContent = '正在移到废纸篓…';
+    $('app-status').textContent = '正在移到废纸篓';
+    $('analysis-status').textContent = '正在移动所选项目…';
+    try {
+      const result = await invoke('trash_analysis_node', { analysisId: request.target.analysisId, nodeId: request.target.nodeId });
+      if (!['moved','missing','changed'].includes(result?.status)) throw new Error('移动结果未确认。');
+      closeTrashDialog(result.status === 'moved');
+      await recoverInvalidNode(request.node, request.entry.report, request.entry, result.status === 'changed' ? 'changed' : 'missing');
+      if (result.status === 'moved') message('info', '已移到废纸篓，列表已更新。重新分析可更新占用。');
+    } catch (error) {
+      closeTrashDialog(false);
+      message('error', '移动未能确认，请在 Finder 检查文件状态后再操作。');
     }
   }
   function drill(node) {
@@ -765,6 +850,9 @@
     $('analysis-location').addEventListener('change', (event) => setPath(event.target.value));
     $('choose-analysis-folder').addEventListener('click', chooseFolder);
     $('cancel-analysis').addEventListener('click', cancel);
+    $('analysis-trash-confirm')?.addEventListener('click', confirmAnalysisTrash);
+    $('analysis-trash-cancel')?.addEventListener('click', () => { if (!trashDialogRequest?.moving) closeTrashDialog(false); });
+    $('analysis-trash-dialog')?.addEventListener('cancel', event => { event.preventDefault(); if (!trashDialogRequest?.moving) closeTrashDialog(false); });
     $('analysis-back').addEventListener('click', () => goBack());
     $('analysis-reveal').addEventListener('click', () => { closeOptions(true); reveal(); });
     $('analysis-sort').addEventListener('change', (event) => { state.sort = event.target.value; state.page = 1; closeOptions(true); render(); });
@@ -803,13 +891,15 @@
         const progress = event.payload;
         if (!progress || typeof progress !== 'object') return;
         const finiteCount = (value) => typeof value === 'number' && Number.isFinite(value) && value >= 0;
-        if (!finiteCount(progress.scannedFiles) && !finiteCount(progress.bytesFound) && (typeof progress.currentPath !== 'string' || !progress.currentPath)) return;
+        const percent = progress.estimatedPercent;
+        const validPercent = typeof percent === 'number' && Number.isFinite(percent) && percent >= 0 && percent <= 99;
+        if (!finiteCount(progress.scannedFiles) && !finiteCount(progress.bytesFound) && !validPercent && percent !== null) return;
         const previous = state.progress || {};
         state.progress = {
-          currentPath: typeof progress.currentPath === 'string' && progress.currentPath ? progress.currentPath : previous.currentPath || state.scanPath,
           scannedFiles: finiteCount(progress.scannedFiles) ? Math.floor(progress.scannedFiles) : previous.scannedFiles || 0,
           bytesFound: finiteCount(progress.bytesFound) ? progress.bytesFound : previous.bytesFound || 0,
         };
+        if (validPercent || percent === null) state.estimatedPercent = percent;
         state.lastProgressAt = performance.now();
         renderProgress();
       }),
@@ -825,6 +915,6 @@
     }
     render();
   }
-  window.macSweepAnalyzer = { scan: () => scanDirectory(), cancel, openFavorite };
+  window.macSweepAnalyzer = { scan: () => scanDirectory(), cancel, openFavorite, contextTarget, revealTarget: id => reveal(findNode(id)), trashTarget };
   init();
 })();

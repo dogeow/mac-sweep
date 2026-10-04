@@ -1296,7 +1296,7 @@ fn validate_item(
     Ok(())
 }
 
-fn native_trash(path: &Path) -> Result<(), String> {
+pub(crate) fn native_trash(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         use trash::macos::{DeleteMethod, TrashContextExtMacos};

@@ -27,6 +27,7 @@
     "allow-open-favorite-directory",
     "allow-cancel-analysis",
     "allow-reveal-analysis-node",
+    "allow-trash-analysis-node",
     "allow-open-privacy-settings"
   ]
 }
