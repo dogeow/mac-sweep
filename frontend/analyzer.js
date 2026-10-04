@@ -939,7 +939,7 @@
             // 99% when the current scan has discovered a larger directory.
             state.estimatedPercent = progress.scannedFiles > referenceFiles ? null : Math.min(99, progress.scannedFiles / referenceFiles * 100);
           } else state.estimatedPercent = percent;
-          timing?.observe(state.estimatedPercent, performance.now());
+          timing?.observe(state.estimatedPercent, performance.now(), Boolean(referenceFiles && finiteCount(progress.scannedFiles) && progress.scannedFiles > referenceFiles));
         }
         state.lastProgressAt = performance.now();
         renderProgress();

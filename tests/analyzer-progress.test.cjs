@@ -347,24 +347,30 @@ test('real analyzer ETA counts down from observed work, waits honestly, and rese
   assert.equal(empty.querySelector('.analysis-empty-eta').textContent, eta.textContent);
   h.tick(10_000);
   h.emit({ estimatedPercent: 20, scannedFiles: 20, bytesFound: 8192 });
-  assert.equal(eta.textContent, '预计剩余 01:20');
+  assert.equal(eta.textContent, '正在更新预计时间…');
   h.tick(1_000);
-  assert.equal(eta.textContent, '预计剩余 01:19');
-  assert.equal(track['aria-valuenow'], '20');
-  assert.equal(fill.style.width, '20%');
-  assert.match(h.elements.get('analysis-progress-count').textContent, /20 个文件/);
-
-  h.tick(2_000);
-  assert.equal(eta.textContent, '等待系统返回，剩余时间更新中…');
-  assert.equal(track['aria-valuenow'], '20');
-  assert.equal(fill.style.width, '20%');
+  h.emit({ estimatedPercent: 21, scannedFiles: 21, bytesFound: 8500 });
+  assert.equal(eta.textContent, '正在更新预计时间…');
+  h.tick(1_000);
   h.emit({ estimatedPercent: 22, scannedFiles: 22, bytesFound: 9000 });
   assert.match(eta.textContent, /^预计剩余 /);
-  assert.notEqual(eta.textContent, '预计剩余 00:00');
+  h.tick(1_000);
+  assert.match(eta.textContent, /^预计剩余 /);
   assert.equal(track['aria-valuenow'], '22');
+  assert.equal(fill.style.width, '22%');
+  assert.match(h.elements.get('analysis-progress-count').textContent, /22 个文件/);
+
+  h.tick(2_000);
+  assert.match(eta.textContent, /^预计剩余 /);
+  assert.equal(track['aria-valuenow'], '22');
+  assert.equal(fill.style.width, '22%');
+  h.emit({ estimatedPercent: 23, scannedFiles: 23, bytesFound: 9500 });
+  assert.match(eta.textContent, /^预计剩余 /);
+  assert.notEqual(eta.textContent, '预计剩余 00:00');
+  assert.equal(track['aria-valuenow'], '23');
 
   h.emit({ estimatedPercent: null, scannedFiles: 30, bytesFound: 10_000 });
-  assert.equal(eta.textContent, '正在估算剩余时间…');
+  assert.match(eta.textContent, /^预计剩余 /);
   assert.equal(empty.querySelector('.analysis-meter-label').textContent, '正在估算');
   assert.equal(Object.hasOwn(track, 'aria-valuenow'), false);
   h.emit({ estimatedPercent: 99, scannedFiles: 99, bytesFound: 20_000 });
@@ -401,6 +407,87 @@ test('real analyzer ETA counts down from observed work, waits honestly, and rese
   assert.equal(eta.textContent, '本轮分析已完成');
 });
 
+test('transient unknown readings keep one ETA while an exceeded file-count reference immediately invalidates it', async () => {
+  const h = await harness();
+  const scan = h.app.scan();
+  const eta = h.elements.get('analysis-progress-eta');
+  const track = h.elements.get('analysis-progress-track');
+  h.tick(10_000);
+  h.emit({ estimatedPercent: 10, scannedFiles: 10, bytesFound: 4096 });
+  assert.match(eta.textContent, /^预计剩余 /);
+  for (let cycle = 0; cycle < 6; cycle += 1) {
+    h.tick(500);
+    h.emit({ estimatedPercent: null, scannedFiles: 20 + cycle * 2, bytesFound: 8192 + cycle });
+    assert.match(eta.textContent, /^预计剩余 /);
+    assert.equal(Object.hasOwn(track, 'aria-valuenow'), false);
+    h.tick(500);
+    h.emit({ estimatedPercent: 11 + cycle, scannedFiles: 21 + cycle * 2, bytesFound: 8193 + cycle });
+    assert.match(eta.textContent, /^预计剩余 /);
+    assert.equal(track['aria-valuenow'], String(11 + cycle));
+  }
+  h.pending.shift().resolve(report({ analysisId: 'stable-reference', sourceAnalysisId: 'stable-reference', scannedFiles: 2000, root: node({ files: 2000 }) }));
+  await scan;
+
+  const rescan = h.app.scan();
+  h.tick(5_000);
+  h.emit({ estimatedPercent: 30, scannedFiles: 1000, bytesFound: 80_000_000_000 });
+  assert.match(eta.textContent, /^预计剩余 /);
+  assert.equal(track['aria-valuenow'], '50');
+  // Invalidation is not an ordinary brief unknown stream: no grace period.
+  h.emit({ estimatedPercent: 30, scannedFiles: 2001, bytesFound: 120_000_000_000 });
+  assert.equal(eta.textContent, '正在更新预计时间…');
+  assert.equal(Object.hasOwn(track, 'aria-valuenow'), false);
+  h.tick(1_000);
+  assert.equal(eta.textContent, '正在更新预计时间…');
+  await h.app.cancel();
+  h.pending.shift().resolve(report({ cancelled: true, scannedFiles: 2001, root: node({ files: 2001, partial: true }) }));
+  await rescan;
+  assert.equal(h.timers.size, 0);
+});
+
+test('short system gaps keep the ETA and a long unknown period needs two stable seconds to recover', async () => {
+  const h = await harness();
+  const scan = h.app.scan();
+  const eta = h.elements.get('analysis-progress-eta');
+  const track = h.elements.get('analysis-progress-track');
+  h.tick(10_000);
+  h.emit({ estimatedPercent: 10, scannedFiles: 10, bytesFound: 4096 });
+  assert.equal(eta.textContent, '预计剩余 01:30');
+  h.tick(3_000);
+  assert.equal(eta.textContent, '预计剩余 01:27');
+  assert.equal(track['aria-valuenow'], '10');
+  h.emit({ estimatedPercent: null, scannedFiles: 20, bytesFound: 8192 });
+  assert.match(eta.textContent, /^预计剩余 /);
+  for (let second = 1; second <= 11; second += 1) {
+    h.tick(1_000);
+    h.emit({ estimatedPercent: null, scannedFiles: 20 + second, bytesFound: 8192 + second });
+  }
+  assert.equal(eta.textContent, '正在更新预计时间…');
+  h.emit({ estimatedPercent: 30, scannedFiles: 100, bytesFound: 10_000 });
+  assert.equal(eta.textContent, '正在更新预计时间…');
+  h.tick(1_000);
+  h.emit({ estimatedPercent: null, scannedFiles: 120, bytesFound: 11_000 });
+  assert.equal(eta.textContent, '正在更新预计时间…');
+  h.tick(1_000);
+  h.emit({ estimatedPercent: 31, scannedFiles: 150, bytesFound: 12_000 });
+  assert.equal(eta.textContent, '正在更新预计时间…');
+  h.tick(1_000);
+  h.emit({ estimatedPercent: 32, scannedFiles: 160, bytesFound: 13_000 });
+  assert.equal(eta.textContent, '正在更新预计时间…');
+  h.tick(1_000);
+  h.emit({ estimatedPercent: 33, scannedFiles: 170, bytesFound: 14_000 });
+  assert.match(eta.textContent, /^预计剩余 /);
+  h.tick(500);
+  h.emit({ estimatedPercent: null, scannedFiles: 180, bytesFound: 15_000 });
+  assert.match(eta.textContent, /^预计剩余 /);
+  h.tick(500);
+  h.emit({ estimatedPercent: 34, scannedFiles: 190, bytesFound: 16_000 });
+  assert.match(eta.textContent, /^预计剩余 /);
+  h.pending.shift().resolve(report({ scannedFiles: 200, root: node({ files: 200 }) }));
+  await scan;
+  assert.equal(h.timers.size, 0);
+});
+
 test('a same-path rescan advances by its completed file-count reference while backend percent stays coarse', async () => {
   const h = await harness();
   const track = h.elements.get('analysis-progress-track');
@@ -421,7 +508,10 @@ test('a same-path rescan advances by its completed file-count reference while ba
   assert.equal(track['aria-valuenow'], '50');
   assert.equal(fill.style.width, '50%');
   assert.equal(eta.textContent, '预计剩余 00:10');
-  h.tick(10_000);
+  h.tick(5_000);
+  h.emit({ estimatedPercent: 30, scannedFiles: 1200, bytesFound: 96_000_000_000 });
+  assert.equal(track['aria-valuenow'], '60');
+  h.tick(5_000);
   h.emit({ estimatedPercent: 30, scannedFiles: 1500, bytesFound: 120_000_000_000 });
   assert.equal(label.textContent, '预计 75%');
   assert.equal(track['aria-valuenow'], '75');

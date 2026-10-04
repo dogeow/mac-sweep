@@ -7,10 +7,11 @@ test('remaining time counts down between real progress updates without inventing
   model.reset(0);
   model.observe(10, 10_000);
   assert.deepEqual(model.snapshot(10_000), { kind: 'countdown', seconds: 90 });
-  model.observe(20, 20_000);
+  for (let second = 11; second <= 20; second++) model.observe(second, second * 1000);
   assert.deepEqual(model.snapshot(21_000), { kind: 'countdown', seconds: 79 });
   assert.equal(timing.format(model.snapshot(21_000)), '预计剩余 01:19');
-  assert.equal(model.snapshot(28_000).kind, 'recalculating');
+  assert.equal(model.snapshot(28_000).kind, 'countdown');
+  assert.equal(model.snapshot(30_000).kind, 'recalculating');
 });
 
 test('constant percentages expire rather than repeatedly restarting the countdown', () => {
@@ -20,8 +21,12 @@ test('constant percentages expire rather than repeatedly restarting the countdow
   for (let time = 11_000; time <= 30_000; time += 1000) model.observe(30, time);
   assert.equal(model.snapshot(30_000).kind, 'recalculating');
   model.observe(50, 31_000);
-  assert.equal(model.snapshot(31_000).kind, 'countdown');
-  assert.ok(model.snapshot(31_000).seconds > 0);
+  assert.equal(model.snapshot(31_000).kind, 'recalculating');
+  model.observe(51, 32_000);
+  assert.equal(model.snapshot(32_000).kind, 'recalculating');
+  model.observe(52, 33_000);
+  assert.equal(model.snapshot(33_000).kind, 'countdown');
+  assert.ok(model.snapshot(33_000).seconds > 0);
 });
 
 test('unknown work, warmup, waits and 99 percent cannot announce a zero-second finish', () => {
@@ -30,16 +35,17 @@ test('unknown work, warmup, waits and 99 percent cannot announce a zero-second f
   model.observe(5, 1000);
   assert.equal(model.snapshot(1000).kind, 'preparing');
   model.observe(30, 10_000);
-  assert.equal(model.snapshot(10_000, true).kind, 'waiting');
+  assert.equal(model.snapshot(13_000, true).kind, 'countdown');
   model.observe(null, 11_000);
-  assert.equal(model.snapshot(11_000).kind, 'preparing');
-  model.observe(99, 12_000);
-  assert.equal(model.snapshot(12_000).kind, 'finishing');
-  assert.equal(timing.format(model.snapshot(12_000)), '正在完成统计…');
+  assert.equal(model.snapshot(11_000).kind, 'countdown');
+  assert.equal(model.snapshot(21_000).kind, 'recalculating');
+  model.observe(99, 22_000);
+  assert.equal(model.snapshot(22_000).kind, 'finishing');
+  assert.equal(timing.format(model.snapshot(22_000)), '正在完成统计…');
   model.finish();
-  assert.equal(model.snapshot(13_000).kind, 'complete');
-  model.observe(10, 14_000);
-  assert.equal(model.snapshot(14_000).kind, 'complete');
+  assert.equal(model.snapshot(23_000).kind, 'complete');
+  model.observe(10, 24_000);
+  assert.equal(model.snapshot(24_000).kind, 'complete');
 });
 
 test('an expired deadline recalculates without false zero, including almost-complete scans', () => {
@@ -82,5 +88,37 @@ test('rate changes adjust the estimate while subsecond notifications retain a sp
 test('clock formatting supports minutes and hours without changing the estimate', () => {
   assert.equal(timing.format({ kind: 'countdown', seconds: 59 }), '预计剩余 00:59');
   assert.equal(timing.format({ kind: 'countdown', seconds: 3661 }), '预计剩余 1:01:01');
-  assert.match(timing.format({ kind: 'waiting' }), /等待系统返回/);
+  assert.equal(timing.format({ kind: 'waiting' }), timing.format({ kind: 'recalculating' }));
+});
+
+test('alternating short unknown readings keep one clock and a genuine invalidation clears it immediately', () => {
+  const model = timing.create();
+  model.reset(0);
+  model.observe(20, 10_000);
+  for (let time = 10_200; time <= 16_000; time += 400) {
+    model.observe(null, time);
+    assert.equal(model.snapshot(time).kind, 'countdown');
+    model.observe(20 + (time - 10_000) / 1000, time + 200);
+    assert.equal(model.snapshot(time + 200).kind, 'countdown');
+  }
+  model.observe(null, 17_000, true);
+  assert.equal(model.snapshot(17_000).kind, 'recalculating');
+  model.reset(20_000);
+  assert.equal(model.snapshot(20_000).kind, 'preparing');
+});
+
+test('a prolonged unknown stream requires an uninterrupted recovery window', () => {
+  const model = timing.create();
+  model.reset(0);
+  model.observe(20, 10_000);
+  model.observe(null, 11_000);
+  assert.equal(model.snapshot(14_000).kind, 'countdown');
+  assert.equal(model.snapshot(21_000).kind, 'recalculating');
+  model.observe(30, 22_000);
+  assert.equal(model.snapshot(22_000).kind, 'recalculating');
+  model.observe(null, 23_000);
+  model.observe(31, 24_000);
+  assert.equal(model.snapshot(25_000).kind, 'recalculating');
+  model.observe(33, 26_000);
+  assert.equal(model.snapshot(26_000).kind, 'countdown');
 });
