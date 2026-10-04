@@ -479,6 +479,7 @@ fn runtime_cache_label(label: &str) -> bool {
         "cocoapods",
         "composer",
         "copilot",
+        "wasilibs",
         "claude",
         "codex",
         "cursor",

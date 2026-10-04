@@ -642,6 +642,7 @@ fn cached_tool_runtimes_and_package_downloads_never_become_default_cleanup() {
     let root = fixture.home.join("Library/Caches");
     let owners = [
         "github-copilot-sdk",
+        "com.github.wasilibs",
         "claude-cli-nodejs",
         "composer",
         "ModrinthApp",
