@@ -372,6 +372,7 @@ dialog::backdrop { background: #00000028; }
 .analysis-empty-meter .analysis-meter-label { font-size: 13px; }
 .analysis-progress .analysis-meter { max-width: 230px; margin-top: 8px; }
 .analysis-progress .analysis-meter-label { font-size: 10px; margin-bottom: 5px; }
+.analysis-progress .analysis-progress-eta { font-size: 11px; font-variant-numeric: tabular-nums; color: var(--secondary); }
 .analysis-meter.is-indeterminate .analysis-meter-fill { width: 30%; animation: analysis-meter-indeterminate 1.6s ease-in-out infinite; }
 @keyframes analysis-meter-shimmer { to { background-position: 130px 0; } }
 @keyframes analysis-meter-indeterminate { 0% { transform: translateX(-100%); } 100% { transform: translateX(340%); } }
@@ -467,6 +468,7 @@ th { height: 28px; text-align: left; font-size: 11px; font-weight: 400; color: v
 .analysis-empty.is-loading > .progress-spinner { width: 23px; height: 23px; margin-bottom: 17px; border-width: 2px; }
 .analysis-empty.is-loading > .text-button { margin-top: 14px; }
 .analysis-empty .analysis-empty-progress { font-size: 13px; color: var(--secondary); font-variant-numeric: tabular-nums; margin-top: 12px; }
+.analysis-empty .analysis-empty-eta { font-size: 17px; font-weight: 500; color: var(--text); font-variant-numeric: tabular-nums; margin: 15px 0 0; }
 .analysis-empty .analysis-empty-location { display: block; max-width: 520px; width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 11px; line-height: 1.6; color: var(--muted); margin: 8px 0 0; }
 .analysis-view.show-details .analysis-empty-location { white-space: normal; overflow: visible; overflow-wrap: anywhere; font-size: 10px; }
 .analysis-view.show-details #analysis-progress-path { white-space: normal; overflow: visible; overflow-wrap: anywhere; text-overflow: clip; }

@@ -3,6 +3,7 @@
   const app = window.macSweep;
   const navigation = window.macSweepAnalysisNavigation;
   const favorites = window.macSweepFavorites;
+  const timing = window.macSweepAnalysisTiming?.create();
   if (!app || !navigation) return;
   const $ = (id) => document.getElementById(id);
   const escape = app.escapeHtml;
@@ -10,6 +11,8 @@
   const invoke = (command, args) => window.__TAURI__.core.invoke(command, args);
   const state = { locations: [], path: '', history: [], revision: 0, favoriteRevision: 0, scanning: false, browsing: false, openingFavorite: false, recovering: false, cancelling: false, page: 1, sort: 'size-desc', chartNodes: new Map(), browseCache: new Map(), invalidatedNodes: new Map(), staleDirectories: new Map(), emptyReason: null, message: null, showChart: false, showDetails: false, scanPath: '', progress: null, estimatedPercent: null, scanStartedAt: 0, lastProgressAt: 0, progressTimer: null };
   const PAGE_SIZE = 100;
+  const scanEstimates = new Map();
+  let referenceFiles = null;
   const palette = ['#5b94ce', '#8b86c6', '#6aaa97', '#bf9167', '#b17eaa', '#829bb5', '#a39a6a', '#7188b9', '#ba8d85', '#8eaa78', '#8398a2', '#a29bb8'];
   const formatBytes = (value) => {
     const number = Math.max(0, Number(value) || 0);
@@ -256,7 +259,7 @@
     const percent = state.estimatedPercent;
     const indeterminate = percent === null;
     wrapper.classList.toggle('is-indeterminate', indeterminate);
-    label.textContent = indeterminate ? '准备中' : percent === 100 ? '已完成 100%' : `预计 ${Math.round(percent)}%`;
+    label.textContent = indeterminate ? state.progress?.scannedFiles > 0 ? '正在估算' : '准备中' : percent === 100 ? '已完成 100%' : `预计 ${Number(percent.toFixed(1))}%`;
     track.setAttribute('role', 'progressbar');
     track.setAttribute('aria-label', '目录分析进度');
     track.setAttribute('aria-valuemin', '0');
@@ -281,6 +284,7 @@
       $('analysis-progress-track')?.removeAttribute('aria-valuenow');
     }
     if (state.browsing) {
+      $('analysis-progress-eta').textContent = '';
       $('analysis-progress-label').textContent = state.cancelling ? '正在停止打开目录…' : `${state.openingFavorite ? '正在打开收藏' : state.recovering ? '正在更新列表' : '正在打开目录'}：${friendlyPath(state.scanPath)}`;
       $('analysis-progress-count').textContent = '';
       if (state.openingFavorite && !entry) $('analysis-empty').innerHTML = `<span class="progress-spinner" aria-hidden="true"></span><strong>正在打开收藏目录…</strong><p>正在确认目录是否可用。</p><button class="text-button" data-analysis-cancel ${state.cancelling ? 'disabled' : ''}>${state.cancelling ? '取消中…' : '取消打开'}</button>`;
@@ -292,17 +296,20 @@
     const waiting = state.scanning && performance.now() - state.lastProgressAt >= 3000;
     const activity = state.cancelling ? '等待系统停止' : waiting ? '继续统计，等待系统返回' : '正在统计';
     const elapsedText = `已用 ${elapsed.toLocaleString()} 秒 · ${activity}`;
+    const etaText = state.cancelling ? '' : window.macSweepAnalysisTiming?.format(timing.snapshot(performance.now(), waiting)) || '正在估算剩余时间…';
+    $('analysis-progress-eta').textContent = etaText;
     const countText = `已查看 ${Number(progress?.scannedFiles || 0).toLocaleString()} 个文件 · 已统计 ${formatBytes(progress?.bytesFound)}`;
     $('analysis-progress-label').textContent = `${state.cancelling ? '正在停止完整分析' : '正在完整分析，以下是上次结果'} · ${elapsedText}`;
     $('analysis-progress-count').textContent = countText;
     if (state.scanning && !entry) {
       const empty = $('analysis-empty');
       // Keep the same cancel button while progress or the elapsed timer updates.
-      if (!empty.querySelector('.analysis-empty-meter')) empty.innerHTML = '<span class="progress-spinner" aria-hidden="true"></span><strong class="analysis-empty-title"></strong><div class="analysis-empty-meter analysis-meter"><span class="analysis-meter-label"></span><div class="analysis-meter-track"><div class="analysis-meter-fill"></div></div></div><p class="analysis-empty-progress"></p><p class="analysis-empty-time"></p><button class="text-button" data-analysis-cancel>停止分析</button>';
+      if (!empty.querySelector('.analysis-empty-meter')) empty.innerHTML = '<span class="progress-spinner" aria-hidden="true"></span><strong class="analysis-empty-title"></strong><div class="analysis-empty-meter analysis-meter"><span class="analysis-meter-label"></span><div class="analysis-meter-track"><div class="analysis-meter-fill"></div></div></div><p class="analysis-empty-eta"></p><p class="analysis-empty-progress"></p><p class="analysis-empty-time"></p><button class="text-button" data-analysis-cancel>停止分析</button>';
       empty.querySelector('.analysis-empty-title').textContent = state.cancelling ? '正在停止分析…' : `正在完整分析${location}`;
       empty.querySelector('.analysis-empty-progress').textContent = countText;
       renderMeter(empty.querySelector('.analysis-empty-meter'), empty.querySelector('.analysis-meter-label'), empty.querySelector('.analysis-meter-track'), empty.querySelector('.analysis-meter-fill'));
       empty.querySelector('.analysis-empty-time').textContent = elapsedText;
+      empty.querySelector('.analysis-empty-eta').textContent = etaText;
       const cancelButton = empty.querySelector('[data-analysis-cancel]');
       cancelButton.disabled = state.cancelling;
       cancelButton.textContent = state.cancelling ? '停止中…' : '停止分析';
@@ -316,6 +323,7 @@
     stopProgressTimer();
     state.scanStartedAt = performance.now();
     state.lastProgressAt = state.scanStartedAt;
+    timing?.reset(state.scanStartedAt);
     const timer = window.setInterval(() => {
       if (!state.scanning || revision !== state.revision) {
         window.clearInterval(timer);
@@ -465,6 +473,9 @@
     state.scanPath = path;
     state.progress = null;
     state.estimatedPercent = null;
+    // Repeated analyses have a better denominator than guessed branch weights.
+    // This is an in-session hint, never a claim that the directory is unchanged.
+    referenceFiles = scanEstimates.get(path) || null;
     startProgressTimer(revision);
     closeOptions();
     app.setAnalysisBusy(true);
@@ -475,7 +486,14 @@
       if (!validReport(report)) throw new Error('目录分析结果格式无效。');
       if (!report.cancelled) {
         state.estimatedPercent = 100;
+        timing?.finish();
         renderProgress();
+        const files = report.scannedFiles;
+        if (Number.isSafeInteger(files) && files >= 1000 && !report.cachedBrowse && (!report.sourceAnalysisId || report.sourceAnalysisId === report.analysisId)) {
+          scanEstimates.delete(path);
+          scanEstimates.set(path, files);
+          if (scanEstimates.size > 16) scanEstimates.delete(scanEstimates.keys().next().value);
+        }
       }
       // Results opened from an older analysis must not survive a fresh source scan.
       state.browseCache.clear();
@@ -915,7 +933,14 @@
           scannedFiles: finiteCount(progress.scannedFiles) ? Math.floor(progress.scannedFiles) : previous.scannedFiles || 0,
           bytesFound: finiteCount(progress.bytesFound) ? progress.bytesFound : previous.bytesFound || 0,
         };
-        if (validPercent || percent === null) state.estimatedPercent = percent;
+        if (validPercent || percent === null) {
+          if (referenceFiles && finiteCount(progress.scannedFiles)) {
+            // Extra files invalidate the old scale; do not cling to a premature
+            // 99% when the current scan has discovered a larger directory.
+            state.estimatedPercent = progress.scannedFiles > referenceFiles ? null : Math.min(99, progress.scannedFiles / referenceFiles * 100);
+          } else state.estimatedPercent = percent;
+          timing?.observe(state.estimatedPercent, performance.now());
+        }
         state.lastProgressAt = performance.now();
         renderProgress();
       }),

@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const navigation = require('../frontend/analysis-navigation.js');
+const timing = require('../frontend/analysis-timing.js');
 
 // Drive the real analyzer with deferred native replies and a controlled clock.
 // This checks async lifetime and truthful progress, without relying on a disk scan.
@@ -84,7 +85,7 @@ async function harness(options = {}) {
     icon: () => '', escapeHtml: (value) => String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('"', '&quot;'),
   };
   const window = {
-    macSweep: app, macSweepAnalysisNavigation: navigation,
+    macSweep: app, macSweepAnalysisNavigation: navigation, macSweepAnalysisTiming: timing,
     setInterval: (callback, delay) => { assert.equal(delay, 1000); const id = ++timerId; timers.set(id, callback); return id; },
     clearInterval: (id) => timers.delete(id),
     addEventListener: (name, listener) => windowListeners.set(name, listener),
@@ -282,7 +283,7 @@ test('event-based estimated progress stays truthful while elapsed time advances 
   assert.equal(empty.querySelector('.analysis-empty-location'), null);
   assert.equal(h.elements.get('analysis-progress-path').textContent, '');
   assert.equal(h.elements.get('analysis-progress-path').title, '');
-  assert.equal(label.textContent, '预计 38%');
+  assert.equal(label.textContent, '预计 37.5%');
   assert.equal(track['aria-valuenow'], '37.5');
   assert.equal(track['aria-valuemin'], '0');
   assert.equal(track['aria-valuemax'], '100');
@@ -294,7 +295,7 @@ test('event-based estimated progress stays truthful while elapsed time advances 
   const realValues = empty.querySelector('.analysis-empty-progress').textContent;
   h.emit({ currentPath: '/example/cache', scannedFiles: NaN, bytesFound: -1 });
   assert.equal(empty.querySelector('.analysis-empty-progress').textContent, realValues);
-  assert.equal(label.textContent, '预计 38%');
+  assert.equal(label.textContent, '预计 37.5%');
   assert.equal(fill.style.width, '37.5%');
   h.tick(5000);
   assert.match(empty.querySelector('.analysis-empty-time').textContent, /已用 5 秒.*等待系统返回/);
@@ -317,7 +318,7 @@ test('unknown estimates remain indeterminate and invalid event percentages canno
   const track = empty.querySelector('.analysis-meter-track');
   h.emit({ estimatedPercent: null, scannedFiles: 10, bytesFound: 3000, currentPath: '/example/secret.txt' });
   h.tick(12000);
-  assert.equal(label.textContent, '准备中');
+  assert.equal(label.textContent, '正在估算');
   assert.equal(wrapper.classList.contains('is-indeterminate'), true);
   assert.equal(Object.hasOwn(track, 'aria-valuenow'), false);
   h.emit({ estimatedPercent: 42, scannedFiles: 20, bytesFound: 5000 });
@@ -329,6 +330,166 @@ test('unknown estimates remain indeterminate and invalid event percentages canno
   assert.equal(label.textContent, '预计 42%');
   h.emit({ estimatedPercent: 99, scannedFiles: 1000 });
   assert.equal(track['aria-valuenow'], '42');
+});
+
+test('real analyzer ETA counts down from observed work, waits honestly, and resets after cancellation', async () => {
+  const h = await harness();
+  const scan = h.app.scan();
+  const empty = h.elements.get('analysis-empty');
+  const eta = h.elements.get('analysis-progress-eta');
+  const track = h.elements.get('analysis-progress-track');
+  const fill = h.elements.get('analysis-progress-fill');
+  assert.equal(eta.textContent, '正在估算剩余时间…');
+
+  h.tick(10_000);
+  h.emit({ estimatedPercent: 10, scannedFiles: 10, bytesFound: 4096 });
+  assert.equal(eta.textContent, '预计剩余 01:30');
+  assert.equal(empty.querySelector('.analysis-empty-eta').textContent, eta.textContent);
+  h.tick(10_000);
+  h.emit({ estimatedPercent: 20, scannedFiles: 20, bytesFound: 8192 });
+  assert.equal(eta.textContent, '预计剩余 01:20');
+  h.tick(1_000);
+  assert.equal(eta.textContent, '预计剩余 01:19');
+  assert.equal(track['aria-valuenow'], '20');
+  assert.equal(fill.style.width, '20%');
+  assert.match(h.elements.get('analysis-progress-count').textContent, /20 个文件/);
+
+  h.tick(2_000);
+  assert.equal(eta.textContent, '等待系统返回，剩余时间更新中…');
+  assert.equal(track['aria-valuenow'], '20');
+  assert.equal(fill.style.width, '20%');
+  h.emit({ estimatedPercent: 22, scannedFiles: 22, bytesFound: 9000 });
+  assert.match(eta.textContent, /^预计剩余 /);
+  assert.notEqual(eta.textContent, '预计剩余 00:00');
+  assert.equal(track['aria-valuenow'], '22');
+
+  h.emit({ estimatedPercent: null, scannedFiles: 30, bytesFound: 10_000 });
+  assert.equal(eta.textContent, '正在估算剩余时间…');
+  assert.equal(empty.querySelector('.analysis-meter-label').textContent, '正在估算');
+  assert.equal(Object.hasOwn(track, 'aria-valuenow'), false);
+  h.emit({ estimatedPercent: 99, scannedFiles: 99, bytesFound: 20_000 });
+  assert.equal(eta.textContent, '正在完成统计…');
+  assert.equal(track['aria-valuenow'], '99');
+  await h.app.cancel();
+  assert.equal(eta.textContent, '');
+  assert.equal(empty.querySelector('.analysis-empty-eta').textContent, '');
+  h.tick(1_000);
+  assert.equal(eta.textContent, '');
+  assert.equal(track['aria-valuenow'], '99');
+  h.pending.shift().resolve(report({ cancelled: true, root: node({ partial: true }) }));
+  await scan;
+  assert.equal(h.timers.size, 0);
+  assert.equal(track['aria-valuenow'], '99');
+  assert.equal(h.elements.get('analysis-progress').classList.contains('hidden'), true);
+
+  const rescan = h.app.scan();
+  assert.equal(h.timers.size, 1);
+  assert.equal(eta.textContent, '正在估算剩余时间…');
+  assert.equal(Object.hasOwn(track, 'aria-valuenow'), false);
+  h.tick(5_000);
+  h.emit({ estimatedPercent: 15, scannedFiles: 15, bytesFound: 4096 });
+  assert.equal(eta.textContent, '预计剩余 00:29');
+  h.pending.shift().resolve(report());
+  await rescan;
+  assert.equal(eta.textContent, '本轮分析已完成');
+  assert.equal(track['aria-valuenow'], '100');
+  assert.equal(fill.style.width, '100%');
+  assert.equal(h.timers.size, 0);
+  h.tick(120_000);
+  h.emit({ estimatedPercent: 99, scannedFiles: 9999 });
+  assert.equal(track['aria-valuenow'], '100');
+  assert.equal(eta.textContent, '本轮分析已完成');
+});
+
+test('a same-path rescan advances by its completed file-count reference while backend percent stays coarse', async () => {
+  const h = await harness();
+  const track = h.elements.get('analysis-progress-track');
+  const fill = h.elements.get('analysis-progress-fill');
+  const label = h.elements.get('analysis-progress-percent');
+  const eta = h.elements.get('analysis-progress-eta');
+  const first = h.app.scan();
+  h.emit({ estimatedPercent: 30, scannedFiles: 1000, bytesFound: 80_000_000_000 });
+  assert.equal(track['aria-valuenow'], '30');
+  // Native full reports identify themselves as their own source analysis.
+  h.pending.shift().resolve(report({ analysisId: 'first-full', sourceAnalysisId: 'first-full', scannedFiles: 2000, root: node({ files: 2000 }) }));
+  await first;
+
+  const rescan = h.app.scan();
+  h.tick(10_000);
+  h.emit({ estimatedPercent: 30, scannedFiles: 1000, bytesFound: 80_000_000_000 });
+  assert.equal(label.textContent, '预计 50%');
+  assert.equal(track['aria-valuenow'], '50');
+  assert.equal(fill.style.width, '50%');
+  assert.equal(eta.textContent, '预计剩余 00:10');
+  h.tick(10_000);
+  h.emit({ estimatedPercent: 30, scannedFiles: 1500, bytesFound: 120_000_000_000 });
+  assert.equal(label.textContent, '预计 75%');
+  assert.equal(track['aria-valuenow'], '75');
+  assert.equal(fill.style.width, '75%');
+  assert.match(h.elements.get('analysis-progress-count').textContent, /1,500 个文件.*120 GB/);
+  assert.match(eta.textContent, /^预计剩余 /);
+  h.tick(1_000);
+  assert.match(eta.textContent, /^预计剩余 /);
+  assert.equal(track['aria-valuenow'], '75');
+  // More bytes alone cannot increase the count-based percentage.
+  h.emit({ estimatedPercent: 30, scannedFiles: 1500, bytesFound: 160_000_000_000 });
+  assert.equal(track['aria-valuenow'], '75');
+  h.pending.shift().resolve(report({ analysisId: 'second-full', sourceAnalysisId: 'second-full', scannedFiles: 2000, root: node({ files: 2000 }) }));
+  await rescan;
+  assert.equal(h.timers.size, 0);
+});
+
+test('larger scans become unknown without replacing references on cancellation or failure, and references stay path scoped', async () => {
+  const h = await harness();
+  const track = h.elements.get('analysis-progress-track');
+  const label = h.elements.get('analysis-progress-percent');
+  const meter = h.elements.get('analysis-progress-meter');
+  const finished = (id, files, overrides = {}) => report({
+    analysisId: id, sourceAnalysisId: id, scannedFiles: files,
+    root: node({ files }), ...overrides,
+  });
+  const first = h.app.scan();
+  h.pending.shift().resolve(finished('reference-2000', 2000));
+  await first;
+
+  const cancelled = h.app.scan();
+  h.emit({ estimatedPercent: 30, scannedFiles: 2001, bytesFound: 120_000_000_000 });
+  assert.equal(label.textContent, '正在估算');
+  assert.equal(Object.hasOwn(track, 'aria-valuenow'), false);
+  assert.equal(meter.classList.contains('is-indeterminate'), true);
+  h.emit({ estimatedPercent: 30, scannedFiles: 5000, bytesFound: 160_000_000_000 });
+  assert.equal(label.textContent, '正在估算');
+  await h.app.cancel();
+  h.pending.shift().resolve(finished('cancelled-5000', 5000, { cancelled: true, root: node({ partial: true, files: 5000 }) }));
+  await cancelled;
+
+  const failed = h.app.scan();
+  h.emit({ estimatedPercent: 30, scannedFiles: 1000, bytesFound: 80_000_000_000 });
+  assert.equal(track['aria-valuenow'], '50');
+  h.pending.shift().reject('fixture reader failed');
+  await failed;
+  const grown = h.app.scan();
+  h.emit({ estimatedPercent: 30, scannedFiles: 1000, bytesFound: 80_000_000_000 });
+  assert.equal(track['aria-valuenow'], '50');
+  h.pending.shift().resolve(finished('reference-2500', 2500));
+  await grown;
+
+  const updated = h.app.scan();
+  h.emit({ estimatedPercent: 30, scannedFiles: 1000, bytesFound: 80_000_000_000 });
+  assert.equal(label.textContent, '预计 40%');
+  assert.equal(track['aria-valuenow'], '40');
+  h.pending.shift().resolve(finished('reference-2500-again', 2500));
+  await updated;
+
+  h.selectLocation('/different');
+  const different = h.app.scan();
+  assert.equal(h.pending[0].args.path, '/different');
+  h.emit({ estimatedPercent: 30, scannedFiles: 1000, bytesFound: 80_000_000_000 });
+  assert.equal(label.textContent, '预计 30%');
+  assert.equal(track['aria-valuenow'], '30');
+  h.pending.shift().resolve(finished('different-reference', 1000, { root: node({ path: '/different', name: 'different', files: 1000 }) }));
+  await different;
+  assert.equal(h.timers.size, 0);
 });
 
 test('only a valid non-cancelled report reaches 100, while cancelled partial reports retain their estimate', async () => {

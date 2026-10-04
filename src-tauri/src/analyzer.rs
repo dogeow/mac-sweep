@@ -23,6 +23,7 @@ const DISPLAY_NODES: u64 = 15_000;
 const DIRECTORY_SUMMARIES: usize = 20_000;
 const MAX_DEPTH: usize = 256;
 const ROOT_PREFETCH_ENTRIES: usize = 100_000;
+const DEEP_PROGRESS_ENTRIES: usize = 1_024;
 // macOS SDK sys/stat.h: SF_DATALESS marks a File Provider object whose content
 // is online. Enumerating an online directory/package can trigger hydration.
 const SF_DATALESS: u32 = 0x4000_0000;
@@ -561,6 +562,9 @@ struct Context<'a, F: Fn(AnalysisProgress)> {
     work_budget: f64,
     work_credit: f64,
     estimate_ready: bool,
+    unknown_work_streams: u64,
+    #[cfg(test)]
+    unthrottled_progress: bool,
 }
 
 impl<F: Fn(AnalysisProgress)> Context<'_, F> {
@@ -591,6 +595,9 @@ impl<F: Fn(AnalysisProgress)> Context<'_, F> {
             work_budget: 1.0,
             work_credit: 0.0,
             estimate_ready: false,
+            unknown_work_streams: 0,
+            #[cfg(test)]
+            unthrottled_progress: false,
         }
     }
 
@@ -619,6 +626,10 @@ impl<F: Fn(AnalysisProgress)> Context<'_, F> {
     }
 
     fn progress_due(&self) -> bool {
+        #[cfg(test)]
+        if self.unthrottled_progress {
+            return true;
+        }
         let now = Instant::now();
         !self
             .last_progress
@@ -639,7 +650,7 @@ impl<F: Fn(AnalysisProgress)> Context<'_, F> {
     }
 
     fn estimated_percent(&self) -> Option<f64> {
-        self.estimate_ready
+        (self.estimate_ready && self.unknown_work_streams == 0)
             .then(|| (self.work_credit * 100.0).clamp(0.0, 99.0))
     }
 
@@ -1063,13 +1074,15 @@ impl Iterator for DirectoryEntries<'_> {
 
 impl DirectoryEntries<'_> {
     fn prepare_progress(self, depth: usize, cancel: &AtomicBool) -> Self {
-        self.prepare_progress_with_limit(depth, cancel, ROOT_PREFETCH_ENTRIES)
+        let limit = if depth <= 2 {
+            ROOT_PREFETCH_ENTRIES
+        } else {
+            DEEP_PROGRESS_ENTRIES
+        };
+        self.prepare_progress_with_limit(cancel, limit)
     }
 
-    fn prepare_progress_with_limit(self, depth: usize, cancel: &AtomicBool, limit: usize) -> Self {
-        if depth > 2 {
-            return self;
-        }
+    fn prepare_progress_with_limit(self, cancel: &AtomicBool, limit: usize) -> Self {
         if matches!(self, Self::Buffered(_)) {
             return self;
         }
@@ -1081,12 +1094,12 @@ impl DirectoryEntries<'_> {
             };
             entries.push(entry);
         }
-        // Preserve every prefetched entry and the remaining stream. Exceeding
-        // this memory bound disables the estimate, never the directory walk.
+        // Reuse this directory's reader, never a separate counting pass. Keep
+        // the bounded prefix and stream the remainder if its size is unknown.
         Self::Prefetched(entries.into_iter(), Box::new(remaining))
     }
 
-    fn progress_weights(&self) -> Option<Vec<f64>> {
+    fn progress_weights(&self, depth: usize) -> Option<Vec<f64>> {
         let Self::Buffered(entries) = self else {
             return None;
         };
@@ -1095,6 +1108,9 @@ impl DirectoryEntries<'_> {
                 .as_slice()
                 .iter()
                 .map(|entry| match entry {
+                    // Deep standard entries are measured once by the walker.
+                    // Do not add file_type/stat calls just to weight progress.
+                    Ok(AnalysisEntry::Standard(_)) if depth > 2 => 1.0,
                     Ok(entry) => entry.progress_weight(),
                     Err(_) => 16.0,
                 })
@@ -1374,7 +1390,7 @@ fn measure_metadata_with_policy<F: Fn(AnalysisProgress)>(
             }
             Ok((entries, truncated)) => {
                 let mut entries = entries.prepare_progress(depth, ctx.cancel);
-                let weights = entries.progress_weights();
+                let weights = entries.progress_weights(depth);
                 let total_weight = weights
                     .as_ref()
                     .map(|weights| weights.iter().sum::<f64>())
@@ -1382,6 +1398,15 @@ fn measure_metadata_with_policy<F: Fn(AnalysisProgress)>(
                 if depth == 0 {
                     ctx.estimate_ready = weights.is_some() && !truncated;
                 }
+                let unknown_stream = weights.is_none();
+                if unknown_stream {
+                    // The amount of remaining work is unknown for this reader.
+                    // Continue the actual walk without showing a fixed percent.
+                    ctx.unknown_work_streams += 1;
+                }
+                // Reserve completion credit once at the selected root, rather
+                // than shrinking every descendant's budget at every depth.
+                let child_budget = work_budget * if depth == 0 { 0.9 } else { 1.0 };
                 let mut completed_entries = 0_u64;
                 if truncated {
                     totals.partial = true;
@@ -1404,13 +1429,13 @@ fn measure_metadata_with_policy<F: Fn(AnalysisProgress)>(
                     completed_entries += 1;
                     ctx.work_budget = match &weights {
                         Some(weights) if total_weight > 0.0 => {
-                            work_budget * 0.9 * weights[position as usize] / total_weight
+                            child_budget * weights[position as usize] / total_weight
                         }
-                        // Unknown streams reserve at least half their work until
-                        // actual exhaustion. Credit follows observed completed
-                        // entries rather than elapsed time or guessed file bytes.
+                        // Credit only observed entries while an unknown reader
+                        // remains indeterminate. Actual exhaustion settles its
+                        // remaining budget; no time or file-byte guesses apply.
                         _ => {
-                            work_budget * 0.5
+                            child_budget
                                 / (completed_entries as f64 * (completed_entries + 1) as f64)
                         }
                     };
@@ -1442,6 +1467,9 @@ fn measure_metadata_with_policy<F: Fn(AnalysisProgress)>(
                             }
                         }
                     }
+                }
+                if unknown_stream {
+                    ctx.unknown_work_streams -= 1;
                 }
             }
         }
@@ -2530,10 +2558,147 @@ mod tests {
         }
         let cancel = AtomicBool::new(false);
         let reader = open_directory_entries(&fixture.0, &cancel).unwrap();
-        let reader = reader.prepare_progress_with_limit(0, &cancel, 2);
-        assert!(reader.progress_weights().is_none());
+        let reader = reader.prepare_progress_with_limit(&cancel, 2);
+        assert!(reader.progress_weights(0).is_none());
         let names: HashSet<_> = reader.map(|entry| entry.unwrap().file_name()).collect();
         assert_eq!(names.len(), 20);
+    }
+
+    #[test]
+    fn deep_leaf_work_keeps_its_credit_through_a_long_directory_chain() {
+        let fixture = Fixture::new();
+        let chain = (0..24)
+            .map(|depth| format!("level-{depth}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        for file in 0..128 {
+            fixture.file(&format!("{chain}/file-{file}.bin"), 32);
+        }
+        let updates = std::cell::RefCell::new(Vec::new());
+        let cancel = AtomicBool::new(false);
+        let mut ctx = Context::new(
+            &cancel,
+            |progress| updates.borrow_mut().push(progress),
+            "deep-progress".into(),
+            fs::metadata(&fixture.0).unwrap().dev(),
+        );
+        ctx.unthrottled_progress = true;
+        let measured = measure(&fixture.0, 0, true, &mut ctx);
+        assert_eq!(measured.totals.files, 128);
+        assert!(!measured.totals.partial);
+        let updates = updates.borrow();
+        let half_done = updates
+            .iter()
+            .find(|progress| progress.scanned_files == 64)
+            .unwrap();
+        assert!(half_done.estimated_percent.unwrap() >= 40.0);
+        let last_leaf = updates
+            .iter()
+            .rev()
+            .find(|progress| progress.scanned_files == 128)
+            .unwrap();
+        assert!(last_leaf.estimated_percent.unwrap() >= 85.0);
+        assert!(last_leaf.estimated_percent.unwrap() < 99.0);
+        let estimates: Vec<_> = updates
+            .iter()
+            .filter_map(|progress| progress.estimated_percent)
+            .collect();
+        assert!(estimates.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(ctx.estimated_percent(), Some(99.0));
+    }
+
+    #[test]
+    fn deep_entry_progress_is_independent_of_file_bytes() {
+        let mut first_entry_estimates = Vec::new();
+        let mut measured_bytes = Vec::new();
+        for file_size in [32, 1_048_576] {
+            let fixture = Fixture::new();
+            fixture.file("a/b/c/d/e/one.bin", file_size);
+            fixture.file("a/b/c/d/e/two.bin", file_size);
+            let updates = std::cell::RefCell::new(Vec::new());
+            let cancel = AtomicBool::new(false);
+            let mut ctx = Context::new(
+                &cancel,
+                |progress| updates.borrow_mut().push(progress),
+                "size-independent-progress".into(),
+                fs::metadata(&fixture.0).unwrap().dev(),
+            );
+            ctx.unthrottled_progress = true;
+            let measured = measure(&fixture.0, 0, true, &mut ctx);
+            assert_eq!(measured.totals.files, 2);
+            measured_bytes.push(measured.totals.bytes);
+            first_entry_estimates.push(
+                updates
+                    .borrow()
+                    .iter()
+                    .find(|progress| progress.scanned_files == 1)
+                    .unwrap()
+                    .estimated_percent
+                    .unwrap(),
+            );
+        }
+        assert!(measured_bytes[1] > measured_bytes[0]);
+        assert_eq!(first_entry_estimates, [45.0, 45.0]);
+    }
+
+    #[test]
+    fn an_oversized_deep_stream_is_indeterminate_and_keeps_every_entry() {
+        let fixture = Fixture::new();
+        for file in 0..DEEP_PROGRESS_ENTRIES + 17 {
+            fixture.file(&format!("a/b/c/d/e/file-{file}.bin"), 32);
+        }
+        let updates = std::cell::RefCell::new(Vec::new());
+        let cancel = AtomicBool::new(false);
+        let mut ctx = Context::new(
+            &cancel,
+            |progress| updates.borrow_mut().push(progress),
+            "deep-stream-progress".into(),
+            fs::metadata(&fixture.0).unwrap().dev(),
+        );
+        ctx.unthrottled_progress = true;
+        let measured = measure(&fixture.0, 0, true, &mut ctx);
+        assert_eq!(measured.totals.files, (DEEP_PROGRESS_ENTRIES + 17) as u64);
+        assert!(!measured.totals.partial);
+        assert!(updates
+            .borrow()
+            .iter()
+            .filter(|progress| progress.scanned_files > 0)
+            .all(|progress| progress.estimated_percent.is_none()));
+        assert_eq!(ctx.unknown_work_streams, 0);
+        assert_eq!(ctx.estimated_percent(), Some(99.0));
+    }
+
+    #[test]
+    fn cancelling_inside_a_deep_unknown_stream_does_not_settle_unfinished_work() {
+        let fixture = Fixture::new();
+        for file in 0..DEEP_PROGRESS_ENTRIES + 17 {
+            fixture.file(&format!("a/b/c/d/e/file-{file}.bin"), 32);
+        }
+        let updates = std::cell::RefCell::new(Vec::new());
+        let cancel = AtomicBool::new(false);
+        let mut ctx = Context::new(
+            &cancel,
+            |progress| {
+                if progress.scanned_files >= 100 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                updates.borrow_mut().push(progress);
+            },
+            "cancelled-deep-stream".into(),
+            fs::metadata(&fixture.0).unwrap().dev(),
+        );
+        ctx.unthrottled_progress = true;
+        let measured = measure(&fixture.0, 0, true, &mut ctx);
+        assert_eq!(measured.totals.files, 100);
+        assert!(measured.totals.partial);
+        assert!(ctx.stopped);
+        assert_eq!(ctx.unknown_work_streams, 0);
+        assert!(ctx.estimated_percent().unwrap() < 99.0);
+        assert!(updates
+            .borrow()
+            .iter()
+            .filter_map(|progress| progress.estimated_percent)
+            .all(|percent| percent < 99.0));
     }
 
     #[test]

@@ -10,6 +10,7 @@
     <script defer src="./app.js"></script>
     <script defer src="./analysis-navigation.js"></script>
     <script defer src="./favorites.js"></script>
+    <script defer src="./analysis-timing.js"></script>
     <script defer src="./analyzer.js"></script>
     <script defer src="./analysis-context-menu.js"></script>
   </head>
@@ -90,7 +91,7 @@
           </details>
         </div>
         <div class="analysis-path" id="analysis-selected-path">选择文件夹以查看实际占用</div>
-        <div class="analysis-progress hidden" id="analysis-progress" role="status" aria-live="polite"><span class="progress-spinner"></span><div><strong id="analysis-progress-label">正在计算大小…</strong><span id="analysis-progress-path" class="hidden" aria-hidden="true"></span><div class="analysis-meter hidden" id="analysis-progress-meter"><span class="analysis-meter-label" id="analysis-progress-percent"></span><div class="analysis-meter-track" id="analysis-progress-track"><div class="analysis-meter-fill" id="analysis-progress-fill"></div></div></div></div><span id="analysis-progress-count"></span><button class="text-button" id="cancel-analysis">停止</button></div>
+        <div class="analysis-progress hidden" id="analysis-progress" role="status" aria-live="polite"><span class="progress-spinner"></span><div><strong id="analysis-progress-label">正在计算大小…</strong><span id="analysis-progress-path" class="hidden" aria-hidden="true"></span><div class="analysis-meter hidden" id="analysis-progress-meter"><span class="analysis-meter-label" id="analysis-progress-percent"></span><div class="analysis-meter-track" id="analysis-progress-track"><div class="analysis-meter-fill" id="analysis-progress-fill"></div></div></div><span class="analysis-progress-eta" id="analysis-progress-eta" aria-live="off" title="按实际扫描进度估算，会随扫描速度调整。"></span></div><span id="analysis-progress-count"></span><button class="text-button" id="cancel-analysis">停止</button></div>
         <div class="analysis-message hidden" id="analysis-message" role="status" aria-live="polite"></div>
         <div class="analysis-notices hidden" id="analysis-notices"><details class="analysis-warnings hidden" id="analysis-warnings"><summary id="analysis-warning-summary">部分文件未能读取</summary><ul id="analysis-warning-list"></ul></details><button class="text-button hidden" id="analysis-permissions">查看访问权限</button></div>
         <div class="analysis-body">
