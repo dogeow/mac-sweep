@@ -121,7 +121,8 @@
   }
   function renderDisk() {
     const disk = state.diskOverview || state.report?.disk;
-    if (!disk || !(disk.totalBytes > 0)) {
+    if (!disk || !Number.isFinite(disk.totalBytes) || !(disk.totalBytes > 0) || !Number.isFinite(disk.availableBytes) || disk.availableBytes < 0) {
+      $('disk-storage-card').classList.remove('low-space', 'warning-space');
       $('disk-description').textContent = state.diskUnavailable || !desktop ? '暂时无法读取磁盘容量' : '正在读取磁盘容量…';
       $('disk-used-label').textContent = '—';
       $('disk-free-label').textContent = '—';
@@ -131,6 +132,8 @@
       return;
     }
     const available = Math.max(0, Math.min(disk.availableBytes, disk.totalBytes));
+    $('disk-storage-card').classList.toggle('low-space', available < 25 * 1000 ** 3);
+    $('disk-storage-card').classList.toggle('warning-space', available >= 25 * 1000 ** 3 && available < 50 * 1000 ** 3);
     const used = disk.totalBytes - available;
     const percent = Math.round((used / disk.totalBytes) * 100);
     $('disk-description').textContent = state.diskUnavailable ? '上次读取的容量，暂时无法更新' : state.diskOverview ? '当前容量快照' : '上次检查时的容量';
@@ -641,7 +644,7 @@
     try {
       const disk = await invoke('get_disk_overview');
       if (revision !== diskRevision) return;
-      if (!disk || !Number.isFinite(Number(disk.totalBytes)) || !(disk.totalBytes > 0) || !Number.isFinite(Number(disk.availableBytes)) || disk.availableBytes < 0) throw new Error('磁盘容量暂时无法读取');
+      if (!disk || !Number.isFinite(disk.totalBytes) || !(disk.totalBytes > 0) || !Number.isFinite(disk.availableBytes) || disk.availableBytes < 0) throw new Error('磁盘容量暂时无法读取');
       state.diskOverview = disk;
       state.diskUnavailable = false;
     } catch (_error) {

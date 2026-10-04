@@ -11,7 +11,7 @@ const candidates = [candidate('one', 1000), candidate('two', 2000)];
 const moved = (item) => ({ id: item.id, path: item.path, bytes: item.bytes, error: null });
 const failed = (item, error = '关联应用正在运行') => ({ ...moved(item), error });
 
-async function harness() {
+async function harness(options = {}) {
   const document = { activeElement: null, addEventListener() {} };
   class Element {
     constructor(id = '', classes = '') {
@@ -93,11 +93,15 @@ async function harness() {
   elements.get('include-caches').checked = true;
   elements.get('min-age').value = '14';
   const replies = new Map();
+  if (Object.hasOwn(options, 'diskOverview')) {
+    replies.set('get_disk_overview', typeof options.diskOverview === 'function' ? options.diskOverview : async () => options.diskOverview);
+  }
   const calls = [];
   const events = [];
+  const windowListeners = new Map();
   const window = {
     location: { search: '' }, MacSweepCleanup: cleanupModel,
-    addEventListener() {}, dispatchEvent: (event) => events.push(event.type),
+    addEventListener: (name, listener) => windowListeners.set(name, listener), dispatchEvent: (event) => events.push(event.type),
     __TAURI__: {
       core: { invoke: async (command, args) => {
         calls.push({ command, args });
@@ -119,6 +123,11 @@ async function harness() {
   return {
     window, elements, calls, events, bottom,
     reply: (command, handler) => replies.set(command, handler),
+    refreshDisk: async (response) => {
+      replies.set('get_disk_overview', typeof response === 'function' ? response : async () => response);
+      await windowListeners.get('focus')();
+      await new Promise(setImmediate);
+    },
     control,
     clean: async (response) => {
       replies.set('clean_items', typeof response === 'function' ? response : async () => response);
@@ -130,6 +139,84 @@ async function harness() {
     settle: () => new Promise(setImmediate),
   };
 }
+
+test('home capacity uses exclusive red and orange warnings at decimal 25 GB and 50 GB boundaries', async () => {
+  const threshold = 25 * 1000 ** 3;
+  const warningThreshold = 50 * 1000 ** 3;
+  for (const [availableBytes, expectedLow, expectedWarning, availableLabel, usedLabel, percent] of [
+    [24_000_000_000, true, false, '24 GB', '76 GB', 76],
+    [threshold - 1, true, false, '25 GB', '75 GB', 75],
+    [threshold, false, true, '25 GB', '75 GB', 75],
+    [threshold + 1, false, true, '25 GB', '75 GB', 75],
+    [49_000_000_000, false, true, '49 GB', '51 GB', 51],
+    [warningThreshold - 1, false, true, '50 GB', '50 GB', 50],
+    [warningThreshold, false, false, '50 GB', '50 GB', 50],
+    [warningThreshold + 1, false, false, '50 GB', '50 GB', 50],
+  ]) {
+    const disk = Object.freeze({ totalBytes: 100_000_000_000, availableBytes });
+    const h = await harness({ diskOverview: disk });
+    h.window.macSweep.showHome();
+    const card = h.elements.get('disk-storage-card');
+    assert.equal(card.classList.contains('low-space'), expectedLow);
+    assert.equal(card.classList.contains('warning-space'), expectedWarning);
+    assert.equal(card.classList.contains('low-space') && card.classList.contains('warning-space'), false);
+    assert.equal(h.elements.get('disk-free-label').textContent, `还剩 ${availableLabel} 可用`);
+    assert.equal(h.elements.get('disk-used-label').textContent, `${usedLabel} 已使用`);
+    assert.equal(h.elements.get('disk-total-label').textContent, '总容量 100 GB');
+    assert.equal(h.elements.get('disk-used-bar').style.width, `${percent}%`);
+    assert.equal(h.elements.get('disk-bar').attrs['aria-valuenow'], String(percent));
+    assert.equal(disk.availableBytes, availableBytes);
+    assert.equal(disk.totalBytes, 100_000_000_000);
+  }
+});
+
+test('unavailable capacity stays unknown instead of showing a false low-space warning', async () => {
+  for (const reply of [null, { totalBytes: 0, availableBytes: 0 }, async () => { throw new Error('Disk unavailable'); }]) {
+    const h = await harness({ diskOverview: reply });
+    h.window.macSweep.showHome();
+    assert.equal(h.elements.get('disk-storage-card').classList.contains('low-space'), false);
+    assert.equal(h.elements.get('disk-storage-card').classList.contains('warning-space'), false);
+    assert.equal(h.elements.get('disk-free-label').textContent, '—');
+    assert.equal(h.elements.get('disk-used-label').textContent, '—');
+    assert.equal(h.elements.get('disk-total-label').textContent, '容量 —');
+    assert.equal(h.elements.get('disk-used-bar').style.width, '0%');
+    assert.equal(h.elements.get('disk-bar').attrs['aria-valuenow'], '0');
+  }
+});
+
+test('real capacity refreshes reset both warning classes through red orange normal and red again', async () => {
+  const h = await harness({ diskOverview: { totalBytes: 100_000_000_000, availableBytes: 24_000_000_000 } });
+  h.window.macSweep.showHome();
+  assert.equal(h.elements.get('disk-storage-card').classList.contains('low-space'), true);
+  assert.equal(h.elements.get('disk-storage-card').classList.contains('warning-space'), false);
+  assert.equal(h.elements.get('disk-free-label').textContent, '还剩 24 GB 可用');
+  assert.equal(h.elements.get('disk-used-bar').style.width, '76%');
+  const calls = h.calls.filter((call) => call.command === 'get_disk_overview').length;
+  await h.refreshDisk(Object.freeze({ totalBytes: 100_000_000_000, availableBytes: 25_000_000_000 }));
+  assert.equal(h.calls.filter((call) => call.command === 'get_disk_overview').length, calls + 1);
+  assert.equal(h.elements.get('disk-storage-card').classList.contains('low-space'), false);
+  assert.equal(h.elements.get('disk-storage-card').classList.contains('warning-space'), true);
+  assert.equal(h.elements.get('disk-free-label').textContent, '还剩 25 GB 可用');
+  assert.equal(h.elements.get('disk-used-label').textContent, '75 GB 已使用');
+  assert.equal(h.elements.get('disk-used-bar').style.width, '75%');
+  assert.equal(h.elements.get('disk-bar').attrs['aria-valuenow'], '75');
+  await h.refreshDisk(Object.freeze({ totalBytes: 100_000_000_000, availableBytes: 50_000_000_000 }));
+  assert.equal(h.calls.filter((call) => call.command === 'get_disk_overview').length, calls + 2);
+  assert.equal(h.elements.get('disk-storage-card').classList.contains('low-space'), false);
+  assert.equal(h.elements.get('disk-storage-card').classList.contains('warning-space'), false);
+  assert.equal(h.elements.get('disk-free-label').textContent, '还剩 50 GB 可用');
+  assert.equal(h.elements.get('disk-used-label').textContent, '50 GB 已使用');
+  assert.equal(h.elements.get('disk-used-bar').style.width, '50%');
+  assert.equal(h.elements.get('disk-bar').attrs['aria-valuenow'], '50');
+  await h.refreshDisk(Object.freeze({ totalBytes: 100_000_000_000, availableBytes: 24_000_000_000 }));
+  assert.equal(h.calls.filter((call) => call.command === 'get_disk_overview').length, calls + 3);
+  assert.equal(h.elements.get('disk-storage-card').classList.contains('low-space'), true);
+  assert.equal(h.elements.get('disk-storage-card').classList.contains('warning-space'), false);
+  assert.equal(h.elements.get('disk-free-label').textContent, '还剩 24 GB 可用');
+  assert.equal(h.elements.get('disk-used-label').textContent, '76 GB 已使用');
+  assert.equal(h.elements.get('disk-used-bar').style.width, '76%');
+  assert.equal(h.elements.get('disk-bar').attrs['aria-valuenow'], '76');
+});
 
 test('confirmed cleanup appears only at the bottom, with records opened on demand', async () => {
   const h = await harness();

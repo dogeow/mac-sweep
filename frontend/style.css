@@ -10,7 +10,7 @@
   --row-alt: #f7f8fa; --row-selected: #eef5ff; --accent: #087bfa; --accent-hover: #006bdf;
   --button: #fff; --input: #fff; --selection: #dce8f7; --good: #47805b;
   --warning: #886725; --warning-bg: #fff8e9; --error: #ad413e; --error-bg: #fff1ef;
-  --progress-bg: #edf4fb; --shadow: #00000015; --disk-track: #e4e7eb; --disk-used: #8b9cad;
+  --progress-bg: #edf4fb; --shadow: #00000015; --disk-track: #e4e7eb; --disk-used: #8b9cad; --disk-low: #d13c36; --disk-warning: #b56600;
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; }
@@ -100,6 +100,10 @@ select { font-size: 12px; color: var(--secondary); background: var(--button); bo
 .storage-meter { flex: 1; min-width: 0; }
 .meter-labels { display: flex; flex-direction: column; gap: 5px; margin-bottom: 10px; font-variant-numeric: tabular-nums; }
 #disk-free-label { font-size: 19px; font-weight: 500; color: var(--text); }
+.storage-card.low-space #disk-free-label { color: var(--disk-low); }
+.storage-card.low-space .disk-bar > span { background: var(--disk-low); }
+.storage-card.warning-space #disk-free-label { color: var(--disk-warning); }
+.storage-card.warning-space .disk-bar > span { background: var(--disk-warning); }
 #disk-used-label { font-size: 11px; color: var(--muted); }
 .disk-bar { height: 7px; background: var(--disk-track); border-radius: 4px; overflow: hidden; }
 .disk-bar > span { height: 100%; width: 0; display: block; background: var(--disk-used); border-radius: 4px; transition: width .2s; }
@@ -522,7 +526,7 @@ th { height: 28px; text-align: left; font-size: 11px; font-weight: 400; color: v
   .analysis-size, .analysis-percentage, .analysis-file-count { font-size: 11px; }
 }
 @media (prefers-color-scheme: dark) {
-  :root { --bg: #252628; --sidebar: #2d2f32; --toolbar: #303236; --text: #e8eaee; --muted: #969da8; --secondary: #c0c5ce; --border: #464a50; --hairline: #3a3d42; --row-alt: #2b2d31; --row-selected: #293c56; --accent: #0a84ff; --accent-hover: #3299ff; --button: #464a51; --input: #232528; --selection: #414d5e; --good: #8cbd99; --warning: #d9ba82; --warning-bg: #39342a; --error: #eba19b; --error-bg: #402d2d; --progress-bg: #273a4f; --shadow: #00000050; --disk-track: #444a52; --disk-used: #93a6bb; }
+  :root { --bg: #252628; --sidebar: #2d2f32; --toolbar: #303236; --text: #e8eaee; --muted: #969da8; --secondary: #c0c5ce; --border: #464a50; --hairline: #3a3d42; --row-alt: #2b2d31; --row-selected: #293c56; --accent: #0a84ff; --accent-hover: #3299ff; --button: #464a51; --input: #232528; --selection: #414d5e; --good: #8cbd99; --warning: #d9ba82; --warning-bg: #39342a; --error: #eba19b; --error-bg: #402d2d; --progress-bg: #273a4f; --shadow: #00000050; --disk-track: #444a52; --disk-used: #93a6bb; --disk-low: #ff6961; --disk-warning: #ffae42; }
   .primary { border-color: #097aef; }
   .nav-item:hover:not(:disabled), .trash-link:hover:not(:disabled) { background: #ffffff08; }
   .secondary:hover:not(:disabled) { filter: brightness(1.1); }
