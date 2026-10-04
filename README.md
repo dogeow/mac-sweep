@@ -4,7 +4,7 @@
 
 ## 下载与打开
 
-在 [GitHub Releases](https://github.com/dogeow/mac-sweep/releases/latest) 下载 `Mac-Sweep-v0.1.10-macos-arm64.zip`，解压后将 **Mac Sweep.app** 拖到「应用程序」文件夹并打开。
+在 [GitHub Releases](https://github.com/dogeow/mac-sweep/releases/latest) 下载 `Mac-Sweep-v0.1.11-macos-arm64.zip`，解压后将 **Mac Sweep.app** 拖到「应用程序」文件夹并打开。
 
 当前版本支持 **Apple Silicon Mac（M 系列芯片），macOS 12 或更新版本**。发布包使用本地 ad hoc 签名，没有 Apple Developer ID 签名或公证；macOS 可能阻止打开。若系统阻止运行，可先从源码构建。
 

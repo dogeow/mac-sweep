@@ -59,9 +59,10 @@ input:disabled { cursor: default; opacity: .45; }
 .favorite-toggle.is-favorite svg, .analysis-favorite-action.is-favorite svg { fill: #d9a23e; stroke: #d9a23e; }
 .analysis-name-cell { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .analysis-name-cell > .analysis-node-name { flex: 1; min-width: 0; }
-.analysis-favorite-action { display: grid; place-items: center; width: 25px; height: 27px; flex-shrink: 0; border-radius: 4px; color: var(--muted); background: transparent; }
-.analysis-favorite-action svg { width: 15px; height: 15px; }
+.analysis-favorite-action.favorite-toggle { display: grid; place-items: center; width: 28px; min-width: 28px; height: 28px; min-height: 28px; padding: 0; gap: 0; flex-shrink: 0; border: 1px solid transparent; border-radius: 5px; color: var(--muted); background: transparent; }
+.analysis-favorite-action svg { width: 16px; height: 16px; }
 .analysis-favorite-action:hover:not(:disabled) { background: var(--selection); color: var(--text); }
+.analysis-favorite-action:focus-visible { outline-offset: -2px; }
 .trash-link { display: flex; align-items: center; gap: 8px; width: 100%; padding: 10px 9px; font-size: 12px; color: var(--secondary); background: transparent; border-radius: 5px; }
 .trash-link:hover:not(:disabled) { background: #00000005; }
 .trash-link svg { width: 15px; height: 15px; }
