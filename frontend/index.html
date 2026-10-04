@@ -64,8 +64,11 @@
         <div class="analysis-browser-header">
           <button class="toolbar-button analysis-back-button" id="analysis-back" aria-label="返回我的 Mac" title="返回我的 Mac"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6" /></svg><span>返回</span></button>
           <nav id="analysis-breadcrumbs" aria-label="目录层级"><span>文件夹</span></nav>
-          <div class="analysis-location-control"><label for="analysis-location">扫描位置</label><div class="analysis-location-select"><span class="location-icon" data-icon="folder" aria-hidden="true"></span><select id="analysis-location" aria-label="扫描位置"><option value="">正在读取位置…</option></select><span class="location-chevron" data-icon="chevron-down" aria-hidden="true"></span></div></div>
-          <button class="toolbar-button" id="choose-analysis-folder" aria-label="选择文件夹" title="选择文件夹…"><span data-icon="folder"></span><span>选择文件夹</span></button>
+          <div class="analysis-location-choice" role="group" aria-label="扫描位置：选择常用位置或自选文件夹，二选一">
+            <div class="analysis-location-control"><label for="analysis-location">扫描位置</label><div class="analysis-location-select"><span class="location-icon" data-icon="folder" aria-hidden="true"></span><select id="analysis-location" aria-label="常用扫描位置"><option value="">正在读取位置…</option></select><span class="location-chevron" data-icon="chevron-down" aria-hidden="true"></span></div></div>
+            <span class="analysis-location-or" aria-hidden="true">或</span>
+            <button class="toolbar-button" id="choose-analysis-folder" aria-label="自选文件夹" title="或者选择其他文件夹"><span data-icon="folder"></span><span>自选文件夹</span></button>
+          </div>
           <details class="analysis-options" id="analysis-options">
             <summary>更多 <span data-icon="chevron-down"></span></summary>
             <div class="analysis-options-menu">
