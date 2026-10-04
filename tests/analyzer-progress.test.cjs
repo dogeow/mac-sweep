@@ -23,6 +23,7 @@ async function harness(options = {}) {
   const inspections = [];
   const reveals = [];
   const document = { activeElement: null, addEventListener() {} };
+  let tableScroll;
   class Element {
     constructor(id, classes = '') {
       this.id = id;
@@ -42,6 +43,7 @@ async function harness(options = {}) {
       this.textContent = '';
       this.writes = 0;
       this.style = {};
+      this.scrollTop = 0;
     }
     set className(value) { this.classes = new Set(value.split(/\s+/).filter(Boolean)); }
     get className() { return [...this.classes].join(' '); }
@@ -60,6 +62,7 @@ async function harness(options = {}) {
       return this.children.get(selector) || null;
     }
     querySelectorAll() { return []; }
+    closest(selector) { return this.id === 'analysis-rows' && selector === '.analysis-table-scroll' ? tableScroll : null; }
     setAttribute(name, value) { this[name] = String(value); }
     removeAttribute(name) { delete this[name]; }
     addEventListener(name, listener) { this.listeners.set(name, listener); }
@@ -70,7 +73,9 @@ async function harness(options = {}) {
   for (const match of html.matchAll(/<[^>]*\bid="([^"]+)"[^>]*>/g)) {
     elements.set(match[1], new Element(match[1], match[0].match(/class="([^"]+)"/)?.[1] || ''));
   }
+  tableScroll = new Element('analysis-table-scroll', 'analysis-table-scroll');
   document.getElementById = (id) => elements.get(id) || null;
+  document.querySelector = (selector) => selector === '.analysis-table-scroll' ? tableScroll : null;
   const app = {
     desktop: true, demo: false, getView: () => view, isBusy: () => busy,
     showAnalysis: () => { if (busy) return false; view = 'analysis'; windowListeners.get('mac-sweep-view')?.(); return true; },
@@ -111,7 +116,7 @@ async function harness(options = {}) {
   vm.runInNewContext(source, { window, document, performance: { now: () => now } });
   await new Promise(setImmediate);
   return {
-    elements, timers, pending, calls, favoriteCalls, favoriteNotices, app: window.macSweepAnalyzer, getView: () => view,
+    elements, tableScroll, timers, pending, calls, favoriteCalls, favoriteNotices, app: window.macSweepAnalyzer, getView: () => view,
     emit: (payload) => progressListener({ payload }),
     tick: (milliseconds) => { now += milliseconds; for (const callback of [...timers.values()]) callback(); },
     unload: () => windowListeners.get('beforeunload')(),
@@ -119,6 +124,8 @@ async function harness(options = {}) {
     back: () => elements.get('analysis-back').listeners.get('click')(),
     breadcrumb: (index) => elements.get('analysis-breadcrumbs').listeners.get('click')({ target: { closest: () => ({ dataset: { historyIndex: String(index) } }) } }),
     selectLocation: (value) => elements.get('analysis-location').listeners.get('change')({ target: { value } }),
+    sort: (value) => elements.get(value === 'name-asc' ? 'analysis-sort-name' : 'analysis-sort-size').listeners.get('click')(),
+    nextPage: () => elements.get('analysis-table-footer').listeners.get('click')({ target: { closest: () => ({ dataset: { analysisPage: 'next' } }) } }),
     settle: () => new Promise(setImmediate),
     queueInspect: (...results) => inspections.push(...results),
     queueReveal: (...results) => reveals.push(...results),
@@ -127,6 +134,7 @@ async function harness(options = {}) {
 }
 const node = (overrides = {}) => ({ id: 'root', path: '/example', name: 'example', kind: 'directory', bytes: 8192, files: 1, children: [], hasChildren: false, partial: false, omittedChildren: 0, ...overrides });
 const report = (overrides = {}) => ({ analysisId: 'fixture', root: node(), scannedFiles: 1, warnings: [], durationMs: 1000, ...overrides });
+const rowIds = (h) => [...h.elements.get('analysis-rows').innerHTML.matchAll(/data-analysis-row="([^"]+)"/g)].map((match) => match[1]);
 function assertSelectedLocation(h, expected) {
   const options = [...h.elements.get('analysis-location').innerHTML.matchAll(/<option\b([^>]*)>/g)];
   const selected = options.filter((match) => /(?:^|\s)selected(?:\s|=|$)/.test(match[1])).map((match) => match[1].match(/\bvalue="([^"]*)"/)[1]);
@@ -134,6 +142,123 @@ function assertSelectedLocation(h, expected) {
   assert.equal(h.elements.get('analysis-selected-path').textContent, expected || '选择文件夹以查看实际占用');
   assert.equal(h.elements.get('analysis-selected-path').title, expected);
 }
+
+test('sorting buttons immediately reorder the current list and select exactly one mode', async () => {
+  const h = await harness();
+  const children = [
+    node({ id: 'small', name: 'Alpha', path: '/example/Alpha', kind: 'file', bytes: 100 }),
+    node({ id: 'large', name: 'Zulu', path: '/example/Zulu', kind: 'file', bytes: 300 }),
+  ];
+  const scan = h.app.scan();
+  h.pending.shift().resolve(report({ root: node({ children, hasChildren: true }) }));
+  await scan;
+  assert.deepEqual(rowIds(h), ['large', 'small']);
+  assert.equal(h.elements.get('analysis-sort-size')['aria-pressed'], 'true');
+  assert.equal(h.elements.get('analysis-sort-name')['aria-pressed'], 'false');
+  const requests = h.calls.length;
+  h.sort('name-asc');
+  assert.deepEqual(rowIds(h), ['small', 'large']);
+  assert.equal(h.elements.get('analysis-sort-size')['aria-pressed'], 'false');
+  assert.equal(h.elements.get('analysis-sort-name')['aria-pressed'], 'true');
+  h.sort('size-desc');
+  assert.deepEqual(rowIds(h), ['large', 'small']);
+  assert.equal(h.elements.get('analysis-sort-size')['aria-pressed'], 'true');
+  assert.equal(h.elements.get('analysis-sort-name')['aria-pressed'], 'false');
+  assert.equal(h.calls.length, requests);
+});
+
+test('a sorting preference chosen before analysis applies to the first result', async () => {
+  const h = await harness();
+  assert.equal(h.elements.get('analysis-display-options').classList.contains('hidden'), true);
+  assert.equal(h.elements.get('analysis-options-hint').classList.contains('hidden'), false);
+  assert.equal(Boolean(h.elements.get('analysis-sort-size').disabled), false);
+  assert.equal(Boolean(h.elements.get('analysis-sort-name').disabled), false);
+  h.sort('name-asc');
+  assert.equal(h.elements.get('analysis-sort-name')['aria-pressed'], 'true');
+  assert.deepEqual(rowIds(h), []);
+  const scan = h.app.scan();
+  h.pending.shift().resolve(report({ root: node({ children: [
+    node({ id: 'large', name: 'Zulu', path: '/example/Zulu', bytes: 300 }),
+    node({ id: 'small', name: 'Alpha', path: '/example/Alpha', bytes: 100 }),
+  ], hasChildren: true }) }));
+  await scan;
+  assert.deepEqual(rowIds(h), ['small', 'large']);
+  assert.equal(h.elements.get('analysis-display-options').classList.contains('hidden'), false);
+  assert.equal(h.elements.get('analysis-options-hint').classList.contains('hidden'), true);
+});
+
+test('an existing list can be sorted while a replacement analysis is pending', async () => {
+  const h = await harness();
+  const root = node({ children: [
+    node({ id: 'small', name: 'Alpha', path: '/example/Alpha', bytes: 100 }),
+    node({ id: 'large', name: 'Zulu', path: '/example/Zulu', bytes: 300 }),
+  ], hasChildren: true });
+  const scan = h.app.scan();
+  h.pending.shift().resolve(report({ root }));
+  await scan;
+  const rescan = h.app.scan();
+  assert.equal(h.elements.get('start-scan').disabled, true);
+  assert.equal(Boolean(h.elements.get('analysis-sort-name').disabled), false);
+  const requests = h.calls.length;
+  h.sort('name-asc');
+  assert.deepEqual(rowIds(h), ['small', 'large']);
+  assert.equal(h.calls.length, requests);
+  assert.equal(h.pending.length, 1);
+  h.pending.shift().resolve(report({ analysisId: 'replacement', root }));
+  await rescan;
+  assert.deepEqual(rowIds(h), ['small', 'large']);
+  assert.equal(h.elements.get('analysis-sort-name')['aria-pressed'], 'true');
+});
+
+test('changing sort resets the current page, saved ancestor pages, and table scroll', async () => {
+  const h = await harness();
+  const makeFiles = (prefix, directory) => Array.from({ length: 101 }, (_, index) => node({
+    id: `${prefix}-${index}`, name: `File ${String(index).padStart(3, '0')}`,
+    path: `${directory}/file-${index}`, kind: 'file', bytes: 200 - index,
+  }));
+  const folder = node({ id: 'folder', name: 'Folder', path: '/example/folder', bytes: 0, children: makeFiles('child', '/example/folder'), hasChildren: true });
+  const scan = h.app.scan();
+  h.pending.shift().resolve(report({ root: node({ children: [...makeFiles('parent', '/example'), folder], hasChildren: true }) }));
+  await scan;
+  h.nextPage();
+  assert.match(h.elements.get('analysis-table-footer').innerHTML, /2 \/ 2/);
+  assert.equal(rowIds(h).includes('folder'), true);
+  await h.clickNode('folder');
+  h.nextPage();
+  assert.match(h.elements.get('analysis-table-footer').innerHTML, /2 \/ 2/);
+  assert.deepEqual(rowIds(h), ['child-100']);
+  h.tableScroll.scrollTop = 900;
+  h.sort('name-asc');
+  assert.match(h.elements.get('analysis-table-footer').innerHTML, /1 \/ 2/);
+  assert.equal(rowIds(h)[0], 'child-0');
+  assert.equal(rowIds(h).length, 100);
+  assert.equal(h.tableScroll.scrollTop, 0);
+  h.back();
+  assertSelectedLocation(h, '/example');
+  assert.match(h.elements.get('analysis-table-footer').innerHTML, /1 \/ 2/);
+  assert.equal(rowIds(h)[0], 'parent-0');
+  assert.equal(rowIds(h).length, 100);
+});
+
+test('size sorting keeps known empty items ahead of unknown sizes and breaks ties by displayed name', async () => {
+  const h = await harness();
+  const scan = h.app.scan();
+  h.pending.shift().resolve(report({ root: node({ children: [
+    node({ id: 'applications', name: 'Applications', path: '/example/Applications', bytes: 40 }),
+    node({ id: 'unknown-high', name: 'Unknown high', path: '/example/unknown-high', bytes: 9999, sizeKnown: false }),
+    node({ id: 'empty', name: 'Empty', path: '/example/empty', bytes: 0 }),
+    node({ id: 'documents', name: 'Documents', path: '/example/Documents', bytes: 40 }),
+    node({ id: 'unknown-low', name: 'Unknown low', path: '/example/unknown-low', bytes: 0, sizeKnown: false }),
+    node({ id: 'big', name: 'Big', path: '/example/big', bytes: 50 }),
+  ], hasChildren: true }) }));
+  await scan;
+  assert.deepEqual(rowIds(h), ['big', 'documents', 'applications', 'empty', 'unknown-high', 'unknown-low']);
+  assert.match(h.elements.get('analysis-rows').innerHTML, /文稿/);
+  assert.match(h.elements.get('analysis-rows').innerHTML, /应用程序/);
+  h.sort('name-asc');
+  const ids = rowIds(h);
+  assert.equal(ids.indexOf('documents') < ids.indexOf('applications'), true);
+});
 
 test('event-based estimated progress stays truthful while elapsed time advances without filenames or cancel focus loss', async () => {
   const h = await harness();

@@ -176,7 +176,18 @@
   }
   function childrenFor(node) {
     const list = [...(node?.children || [])];
-    return list.sort((a, b) => state.sort === 'name-asc' ? String(a.name).localeCompare(String(b.name), 'zh-CN') : Number(sizeKnown(b)) - Number(sizeKnown(a)) || b.bytes - a.bytes);
+    const byName = (a, b) => friendlyName(a).localeCompare(friendlyName(b), 'zh-CN', { numeric: true }) || String(a.name).localeCompare(String(b.name), 'zh-CN', { numeric: true });
+    return list.sort((a, b) => state.sort === 'name-asc' ? byName(a, b) : Number(sizeKnown(b)) - Number(sizeKnown(a)) || (sizeKnown(a) && sizeKnown(b) ? b.bytes - a.bytes : 0) || byName(a, b));
+  }
+  function setSort(sort) {
+    if (sort !== 'size-desc' && sort !== 'name-asc') return;
+    state.sort = sort;
+    state.page = 1;
+    for (const entry of state.history) entry.page = 1;
+    closeOptions(true);
+    render();
+    const scroll = $('analysis-rows').closest('.analysis-table-scroll');
+    if (scroll) scroll.scrollTop = 0;
   }
   function sector(startAngle, endAngle, inner, outer) {
     if (endAngle - startAngle > 359.98) endAngle = startAngle + 359.98;
@@ -342,14 +353,18 @@
       favoriteButton.setAttribute('aria-label', filled ? '取消收藏当前目录' : '收藏当前目录');
       favoriteButton.disabled = busy || !favorites || !favorites.canEdit() || !node || node.kind !== 'directory' || node.unavailable || !app.desktop || app.demo;
     }
-    $('analysis-chart-toggle').textContent = state.showChart ? '收起占用图' : '显示占用图';
+    $('analysis-chart-toggle-label').textContent = state.showChart ? '收起占用图' : '显示占用图';
     $('analysis-chart-toggle').setAttribute('aria-pressed', String(state.showChart));
-    $('analysis-details-toggle').textContent = state.showDetails ? '收起详细信息' : '详细信息';
+    $('analysis-details-toggle-label').textContent = state.showDetails ? '收起详细信息' : '显示详细信息';
     $('analysis-details-toggle').setAttribute('aria-expanded', String(state.showDetails));
     $('analysis-details-toggle').setAttribute('aria-pressed', String(state.showDetails));
     $('analysis-chart-toggle').disabled = !node;
     $('analysis-details-toggle').disabled = !node && !state.scanning;
-    $('analysis-sort').disabled = busy || !node;
+    // Sorting only rearranges the local list, including a retained scan snapshot.
+    $('analysis-sort-size').setAttribute('aria-pressed', String(state.sort === 'size-desc'));
+    $('analysis-sort-name').setAttribute('aria-pressed', String(state.sort === 'name-asc'));
+    $('analysis-display-options').classList.toggle('hidden', !node);
+    $('analysis-options-hint').classList.toggle('hidden', Boolean(node));
     if (app.getView() === 'analysis') {
       $('page-label').textContent = node ? friendlyName(node) : '按大小查看文件夹';
       $('start-scan').disabled = busy || !state.path || !app.desktop || app.demo;
@@ -855,7 +870,8 @@
     $('analysis-trash-dialog')?.addEventListener('cancel', event => { event.preventDefault(); if (!trashDialogRequest?.moving) closeTrashDialog(false); });
     $('analysis-back').addEventListener('click', () => goBack());
     $('analysis-reveal').addEventListener('click', () => { closeOptions(true); reveal(); });
-    $('analysis-sort').addEventListener('change', (event) => { state.sort = event.target.value; state.page = 1; closeOptions(true); render(); });
+    $('analysis-sort-size').addEventListener('click', () => setSort('size-desc'));
+    $('analysis-sort-name').addEventListener('click', () => setSort('name-asc'));
     $('check-cleanup-suggestions').addEventListener('click', () => { if (!app.isBusy()) app.showCleanupAndScan(); });
     $('analysis-breadcrumbs').addEventListener('click', (event) => { const button = event.target.closest('[data-history-index]'); if (button) goBack(Number(button.dataset.historyIndex)); });
     $('analysis-view').addEventListener('click', (event) => {

@@ -72,10 +72,18 @@
           <details class="analysis-options" id="analysis-options">
             <summary>更多 <span data-icon="chevron-down"></span></summary>
             <div class="analysis-options-menu">
-              <label for="analysis-sort">排列方式<select id="analysis-sort" aria-label="目录排序"><option value="size-desc">大的在前</option><option value="name-asc">按名称</option></select></label>
-              <button class="text-button" id="analysis-chart-toggle" aria-pressed="false">显示占用图</button>
-              <button class="text-button" id="analysis-details-toggle" aria-pressed="false">更多信息</button>
-              <button class="text-button" id="analysis-reveal" disabled>在 Finder 中显示</button>
+              <div class="analysis-option-heading" id="analysis-sort-label">排列方式</div>
+              <div id="analysis-sort" role="group" aria-labelledby="analysis-sort-label">
+                <button class="analysis-option" id="analysis-sort-size" aria-pressed="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" aria-hidden="true"><path d="M4 6h16M4 12h11M4 18h6"/></svg><span>大的在前</span><span class="analysis-option-check" data-icon="check"></span></button>
+                <button class="analysis-option" id="analysis-sort-name" aria-pressed="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m3 11 3-7 3 7M4 9h4M3 15h6l-6 6h6M17 4v17m-3-3 3 3 3-3"/></svg><span>按名称</span><span class="analysis-option-check" data-icon="check"></span></button>
+              </div>
+              <div class="analysis-display-options hidden" id="analysis-display-options">
+                <div class="analysis-option-heading">显示与操作</div>
+                <button class="analysis-option" id="analysis-chart-toggle" aria-pressed="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v9h9A9 9 0 0 0 12 3Z"/><path d="M8 4a9 9 0 1 0 12 12H8Z"/></svg><span id="analysis-chart-toggle-label">显示占用图</span><span class="analysis-option-check" data-icon="check"></span></button>
+                <button class="analysis-option" id="analysis-details-toggle" aria-pressed="false"><span data-icon="info"></span><span id="analysis-details-toggle-label">显示详细信息</span><span class="analysis-option-check" data-icon="check"></span></button>
+                <button class="analysis-option" id="analysis-reveal" disabled><span data-icon="folder"></span><span>在 Finder 中显示</span><span class="analysis-option-trailing" data-icon="arrow-up-right"></span></button>
+              </div>
+              <p class="analysis-options-hint" id="analysis-options-hint">先选好排列方式，再开始分析。</p>
               <details class="analysis-storage-info hidden" id="analysis-storage-info"><summary>空间统计说明</summary><div id="analysis-space-details"></div></details>
               <p class="analysis-permission-help hidden" id="analysis-permission-help">系统设置 → 隐私与安全性 → 完全磁盘访问权限，添加 Mac Sweep，然后重新打开应用并扫描。</p>
             </div>
