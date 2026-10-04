@@ -21,6 +21,17 @@
   function anchor(parts) {
     for (let index = 0; index + 2 < parts.length; index += 1) {
       if (parts[index] !== 'Users') continue;
+      // Shared download caches and sandbox caches have explicit roots. Group
+      // candidate-only branches under those roots, not their hash prefixes.
+      const relative = parts.slice(index + 2);
+      const cacheRoots = [
+        ['.npm', '_cacache'], ['.cargo', 'registry', 'cache'],
+        ['go', 'pkg', 'mod', 'cache', 'download'], ['.gradle', 'caches'],
+        ['Library', 'pnpm', 'store'], ['Library', 'Developer', 'Xcode', 'DerivedData'],
+      ];
+      const cacheRoot = cacheRoots.find((root) => root.every((name, offset) => relative[offset] === name));
+      if (cacheRoot) return { end: index + 1 + cacheRoot.length, owner: false };
+      if (relative[0] === 'Library' && relative[1] === 'Containers' && relative[2] && relative[3] === 'Data' && relative[4] === 'Library' && relative[5] === 'Caches') return { end: index + 7, owner: false };
       if (parts[index + 2] === 'Library' && ['Caches', 'Logs', 'Application Support', 'Saved Application State', 'Preferences'].includes(parts[index + 3])) return { end: index + 3, owner: parts[index + 3] !== 'Preferences' };
       if (parts[index + 2] === '.cache') return { end: index + 2, owner: true };
       if (parts[index + 2] === 'Downloads') return { end: index + 2, owner: false };

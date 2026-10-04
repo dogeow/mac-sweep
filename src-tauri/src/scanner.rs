@@ -14,8 +14,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const MAX_VISITS: u64 = 150_000;
-const MAX_ITEMS: usize = 2_000;
+const MAX_VISITS: u64 = 1_000_000;
+const MAX_ITEMS: usize = 10_000;
+const MAX_SOURCE_ITEMS: usize = 500;
 const MAX_MANIFEST_ENTRIES: u64 = 25_000;
 const MAX_DEPTH: usize = 32;
 const MAX_WARNINGS: usize = 60;
@@ -61,6 +62,7 @@ pub struct CleanupItem {
     pub risk: String,
     pub bytes: u64,
     pub files: u64,
+    pub is_directory: bool,
     pub modified_at: u64,
     pub reason: String,
     pub selected_by_default: bool,
@@ -122,6 +124,7 @@ pub struct ScanSnapshot {
     home: PathBuf,
     options: ScanOptions,
     validated: HashMap<String, ValidatedItem>,
+    source_counts: HashMap<(String, String), usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -180,10 +183,12 @@ struct Manifest {
 #[derive(Clone, Copy, Debug)]
 enum Rule {
     Cache,
+    RebuildableCache,
     Log,
     Installer,
     OrphanPreference,
     OrphanMetadata,
+    OrphanState,
 }
 
 #[derive(Clone)]
@@ -400,7 +405,42 @@ fn protected_label(label: &str) -> bool {
 }
 
 fn protected_file(path: &Path) -> bool {
-    protected_label(&file_name(path))
+    let name = file_name(path).to_ascii_lowercase();
+    // Browser/account state can have no extension. Only regenerable caches are
+    // eligible, including when a profile puts these files inside a cache root.
+    protected_label(&name)
+        || matches!(
+            name.as_str(),
+            "cookies"
+                | "history"
+                | "login data"
+                | "web data"
+                | "bookmarks"
+                | "preferences"
+                | "secure preferences"
+                | "sessions"
+                | "session storage"
+                | "local storage"
+                | "indexeddb"
+                | "service worker"
+                | "cache storage"
+                | "cachestorage"
+                | "sessionstore.jsonlz4"
+                | "logins.json"
+        )
+        || ["cookies-", "history-", "login data-", "web data-"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        || [
+            ".db-wal",
+            ".db-shm",
+            ".db-journal",
+            ".sqlite-wal",
+            ".sqlite-shm",
+            ".sqlite-journal",
+        ]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
         || matches!(
             path.extension()
                 .and_then(|extension| extension.to_str())
@@ -434,10 +474,108 @@ fn runtime_cache_label(label: &str) -> bool {
         "npm",
         "yarn",
         "pnpm",
+        "homebrew",
+        "gradle",
+        "cocoapods",
+        "composer",
+        "copilot",
+        "claude",
+        "codex",
+        "cursor",
+        "modrinth",
+        "mcaselector",
     ]
     .iter()
     .any(|runtime| label.contains(runtime))
         || matches!(label.as_str(), "pip" | "uv" | "node" | "deno" | "bun")
+}
+
+// Explicit regenerable locations, not entire tool homes, browser profiles,
+// sandbox containers, or Application Support directories.
+fn fixed_cache_sources(home: &Path) -> Vec<(PathBuf, &'static str)> {
+    [
+        (".npm/_cacache", "npm"),
+        (".cache/pip", "pip"),
+        (".cache/uv", "uv"),
+        (".cache/node-gyp", "node-gyp"),
+        (".cache/yarn", "Yarn"),
+        (".cache/pnpm", "pnpm"),
+        (".cargo/registry/cache", "Cargo"),
+        ("go/pkg/mod/cache/download", "Go"),
+        (".gradle/caches", "Gradle"),
+        ("Library/pnpm/store", "pnpm"),
+        ("Library/Caches/Homebrew", "Homebrew"),
+        ("Library/Caches/CocoaPods", "CocoaPods"),
+        ("Library/Caches/pip", "pip"),
+        ("Library/Caches/uv", "uv"),
+        ("Library/Caches/Yarn", "Yarn"),
+        ("Library/Developer/Xcode/DerivedData", "Xcode"),
+        ("Library/Caches/com.apple.dt.Xcode", "Xcode"),
+        ("Library/Caches/Google/Chrome", "Google Chrome"),
+        ("Library/Caches/com.google.Chrome", "Google Chrome"),
+        ("Library/Caches/Firefox/Profiles", "Firefox"),
+        ("Library/Caches/Microsoft Edge", "Microsoft Edge"),
+        ("Library/Caches/com.microsoft.edgemac", "Microsoft Edge"),
+        ("Library/Caches/com.apple.Safari/WebKitCache", "Safari"),
+    ]
+    .into_iter()
+    .map(|(path, owner)| (home.join(path), owner))
+    .collect()
+}
+
+const APP_CACHE_FOLDERS: [&str; 6] = [
+    "Cache",
+    "Code Cache",
+    "GPUCache",
+    "DawnCache",
+    "DawnGraphiteCache",
+    "DawnWebGPUCache",
+];
+
+fn extra_root_allowed(home: &Path, root: &Path, owner: &str) -> bool {
+    if fixed_cache_sources(home)
+        .iter()
+        .any(|(path, name)| path == root && *name == owner)
+    {
+        return true;
+    }
+    // Derive both the owner and the root from literal normal components. Never
+    // accept paths outside the allowlist even if a registered item is malformed.
+    if owner.is_empty()
+        || protected_label(owner)
+        || Path::new(owner).components().count() != 1
+        || !matches!(
+            Path::new(owner).components().next(),
+            Some(Component::Normal(_))
+        )
+    {
+        return false;
+    }
+    if reverse_dns(owner)
+        && root
+            == home
+                .join("Library/Containers")
+                .join(owner)
+                .join("Data/Library/Caches")
+    {
+        return true;
+    }
+    APP_CACHE_FOLDERS.iter().any(|folder| {
+        root == home
+            .join("Library/Application Support")
+            .join(owner)
+            .join(folder)
+    })
+}
+
+fn cache_display_name(owner: &str) -> String {
+    match owner {
+        "npm" | "Cargo" | "Go" | "Homebrew" | "CocoaPods" | "Yarn" | "pnpm" => {
+            format!("{owner} 下载缓存")
+        }
+        "Xcode" => "Xcode 编译缓存".into(),
+        _ => owner.into(),
+    }
 }
 
 fn protected_content_file(path: &Path, allow_app_state: bool) -> bool {
@@ -835,12 +973,15 @@ fn add_candidate<F: Fn(ScanProgress)>(
     owner_name: &str,
     prepared: Option<(Fingerprint, Manifest)>,
 ) {
-    if snapshot.report.items.len() >= MAX_ITEMS {
-        ctx.stopped = true;
-        ctx.warn("候选项目已达到 2,000 项上限，当前结果为部分结果。请按类别分别扫描。".into());
-        return;
-    }
-    if protected_label(owner_name) || apps.active_related(owner_name) {
+    let extra_cache = matches!(rule, Rule::RebuildableCache);
+    if (extra_cache && !extra_root_allowed(&snapshot.home, root, owner_name))
+        || (!extra_cache && protected_label(owner_name))
+        || apps.active_related(owner_name)
+        || orphan_id
+            .as_ref()
+            .is_some_and(|id| !apps.complete || apps.related(id).is_some())
+        || source_full(snapshot, ctx, rule, owner_name, orphan_id.as_deref())
+    {
         return;
     }
     let measured = if let Some(prepared) = prepared {
@@ -875,23 +1016,19 @@ fn add_candidate<F: Fn(ScanProgress)>(
     };
     let runtime_cache = matches!(rule, Rule::Cache) && runtime_cache_label(owner_name);
     let review = !apps.active_complete
+        || extra_cache
         || runtime_cache
         || orphan_id.is_some()
         || matches!(
             rule,
-            Rule::Installer | Rule::OrphanMetadata | Rule::OrphanPreference
+            Rule::Installer | Rule::OrphanMetadata | Rule::OrphanPreference | Rule::OrphanState
         );
-    let category = if orphan_id.is_some() {
-        "orphan"
-    } else {
-        match rule {
-            Rule::Cache => "cache",
-            Rule::Log => "logs",
-            Rule::Installer => "installer",
-            _ => "orphan",
-        }
-    };
-    let reason = if matches!(rule, Rule::OrphanMetadata) {
+    let category = candidate_category(rule, orphan_id.as_deref());
+    let reason = if extra_cache {
+        "已知可重新生成的下载、编译或应用缓存，候选及全部子项均超过保留天数。可能影响离线工作、首次打开或重新编译；先退出相关工具并手动确认。不会包含整个应用数据目录。"
+    } else if matches!(rule, Rule::OrphanState) {
+        "疑似已卸载应用留下的窗口恢复状态。未找到同标识或同开发者的应用并不证明已经卸载，可能影响恢复上次打开的窗口；需手动确认。"
+    } else if matches!(rule, Rule::OrphanMetadata) {
         "旧应用数据文件夹：未在常见应用目录找到同标识或同开发者的应用，但这不证明已经卸载。可能包含设置、数据库、聊天记录和个人文件，必须打开查看并手动确认。"
     } else if orphan_id.is_some() {
         "未在常见应用目录找到同标识或同开发者的应用；这不证明已经卸载，可能属于便携应用或后台组件。仅列出旧缓存或偏好元数据，需手动核对。"
@@ -919,14 +1056,21 @@ fn add_candidate<F: Fn(ScanProgress)>(
         risk: if review { "review" } else { "low" }.into(),
         bytes: manifest.bytes,
         files: manifest.files,
+        is_directory: fingerprint.mode & 0o170_000 == 0o040_000,
         modified_at: manifest.newest,
         reason: reason.into(),
         selected_by_default: !review,
-        app_name: app.map(|app| app.name.clone()),
+        app_name: app
+            .map(|app| app.name.clone())
+            .or_else(|| extra_cache.then(|| cache_display_name(owner_name))),
         bundle_id: orphan_id.clone().or_else(|| app.map(|app| app.id.clone())),
     };
     ctx.found += 1;
     ctx.bytes = ctx.bytes.saturating_add(item.bytes);
+    *snapshot
+        .source_counts
+        .entry((category.into(), owner_name.into()))
+        .or_default() += 1;
     snapshot.validated.insert(
         id,
         ValidatedItem {
@@ -941,6 +1085,189 @@ fn add_candidate<F: Fn(ScanProgress)>(
         },
     );
     snapshot.report.items.push(item);
+}
+
+fn candidate_category(rule: Rule, orphan_id: Option<&str>) -> &'static str {
+    if orphan_id.is_some() {
+        return "orphan";
+    }
+    match rule {
+        Rule::Cache | Rule::RebuildableCache => "cache",
+        Rule::Log => "logs",
+        Rule::Installer => "installer",
+        _ => "orphan",
+    }
+}
+
+fn source_full<F: Fn(ScanProgress)>(
+    snapshot: &ScanSnapshot,
+    ctx: &mut Context<'_, F>,
+    rule: Rule,
+    owner: &str,
+    orphan: Option<&str>,
+) -> bool {
+    if snapshot.report.items.len() >= MAX_ITEMS {
+        ctx.warn("候选项目已达到 10,000 项上限，当前结果为部分结果。可按类别分别检查。".into());
+        return true;
+    }
+    let key = (candidate_category(rule, orphan).into(), owner.into());
+    if snapshot.source_counts.get(&key).copied().unwrap_or(0) >= MAX_SOURCE_ITEMS {
+        ctx.warn(format!(
+            "{owner} 的本类候选已达到 500 项，已保留其余内容并继续检查其他应用。"
+        ));
+        return true;
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_cache_branches<F: Fn(ScanProgress)>(
+    snapshot: &mut ScanSnapshot,
+    ctx: &mut Context<'_, F>,
+    apps: &AppInventory,
+    root: &Path,
+    start: &Path,
+    rule: Rule,
+    owner: &str,
+    orphan: Option<&str>,
+    depth: usize,
+) {
+    if ctx.stopped || apps.active_related(owner) || source_full(snapshot, ctx, rule, owner, orphan)
+    {
+        return;
+    }
+    if depth > MAX_DEPTH {
+        ctx.handle_walk_error(WalkError::Limit);
+        return;
+    }
+    if protected_file(start) {
+        return;
+    }
+    let cutoff = ctx.cutoff;
+    match inventory(start, Some(cutoff), false, &mut |path, file| {
+        ctx.visit(path, file)
+    }) {
+        Ok(prepared) => {
+            add_candidate(
+                snapshot,
+                ctx,
+                apps,
+                start,
+                root,
+                rule,
+                orphan.map(str::to_owned),
+                owner,
+                Some(prepared),
+            );
+            // Never also register descendants of a complete directory candidate.
+            return;
+        }
+        Err(WalkError::Cancelled) => return,
+        Err(error) => ctx.handle_walk_error(error),
+    }
+    if ctx.stopped
+        || !fs::symlink_metadata(start).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+    {
+        return;
+    }
+    // Preserve a fresh/partly protected parent. Independently validate complete
+    // old branches rather than flattening every old descendant into a candidate.
+    if let Some(children) = read_children(start, ctx) {
+        for child in children {
+            if ctx.stopped || source_full(snapshot, ctx, rule, owner, orphan) {
+                break;
+            }
+            walk_cache_branches(
+                snapshot,
+                ctx,
+                apps,
+                root,
+                &child,
+                rule,
+                owner,
+                orphan,
+                depth + 1,
+            );
+        }
+    }
+}
+
+fn scan_extra_caches<F: Fn(ScanProgress)>(
+    snapshot: &mut ScanSnapshot,
+    ctx: &mut Context<'_, F>,
+    apps: &AppInventory,
+) {
+    let home = snapshot.home.clone();
+    let mut sources: Vec<(PathBuf, String)> = fixed_cache_sources(&home)
+        .into_iter()
+        .map(|(path, owner)| (path, owner.into()))
+        .collect();
+    for (base, sandbox) in [
+        (home.join("Library/Containers"), true),
+        (home.join("Library/Application Support"), false),
+    ] {
+        if ctx.stopped || !safe_root(&base, ctx) {
+            continue;
+        }
+        let Some(entries) = read_children(&base, ctx) else {
+            continue;
+        };
+        for app in entries {
+            let owner = file_name(&app);
+            if ctx.stopped {
+                break;
+            }
+            if owner.starts_with('.')
+                || protected_label(&owner)
+                || apps.active_related(&owner)
+                || !fs::symlink_metadata(&app)
+                    .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+            {
+                continue;
+            }
+            if sandbox {
+                if reverse_dns(&owner) {
+                    sources.push((app.join("Data/Library/Caches"), owner));
+                }
+            } else {
+                for name in APP_CACHE_FOLDERS {
+                    sources.push((app.join(name), owner.clone()));
+                }
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    for (root, owner) in sources {
+        if ctx.stopped || snapshot.report.items.len() >= MAX_ITEMS {
+            break;
+        }
+        if !seen.insert(root.clone())
+            || apps.active_related(&owner)
+            || !extra_root_allowed(&home, &root, &owner)
+            || !safe_root(&root, ctx)
+        {
+            continue;
+        }
+        // Keep the cache root itself so the application can reuse its location.
+        if let Some(children) = read_children(&root, ctx) {
+            for child in children {
+                if ctx.stopped || source_full(snapshot, ctx, Rule::RebuildableCache, &owner, None) {
+                    break;
+                }
+                walk_cache_branches(
+                    snapshot,
+                    ctx,
+                    apps,
+                    &root,
+                    &child,
+                    Rule::RebuildableCache,
+                    &owner,
+                    None,
+                    0,
+                );
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -959,12 +1286,43 @@ fn walk_files<F: Fn(ScanProgress)>(
         if ctx.stopped || apps.active_related(owner_name) {
             return;
         }
+        let directory_owner = if owner_name.is_empty() {
+            directory
+                .strip_prefix(root)
+                .ok()
+                .and_then(|relative| relative.components().next())
+                .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                .unwrap_or_default()
+        } else {
+            owner_name.into()
+        };
+        if !directory_owner.is_empty()
+            && source_full(snapshot, ctx, rule, &directory_owner, orphan_id)
+        {
+            continue;
+        }
         let Some(children) = read_children(&directory, ctx) else {
             continue;
         };
         for child in children {
             if ctx.stopped {
                 return;
+            }
+            let relative_owner = if owner_name.is_empty() {
+                child
+                    .strip_prefix(root)
+                    .ok()
+                    .and_then(|relative| relative.components().next())
+                    .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            } else {
+                owner_name.into()
+            };
+            if protected_label(&relative_owner)
+                || apps.active_related(&relative_owner)
+                || source_full(snapshot, ctx, rule, &relative_owner, orphan_id)
+            {
+                continue;
             }
             let metadata = match fs::symlink_metadata(&child) {
                 Ok(metadata) => metadata,
@@ -977,19 +1335,6 @@ fn walk_files<F: Fn(ScanProgress)>(
                 return;
             }
             if metadata.file_type().is_symlink() || protected_file(&child) {
-                continue;
-            }
-            let relative_owner = if owner_name.is_empty() {
-                child
-                    .strip_prefix(root)
-                    .ok()
-                    .and_then(|relative| relative.components().next())
-                    .map(|component| component.as_os_str().to_string_lossy().into_owned())
-                    .unwrap_or_default()
-            } else {
-                owner_name.into()
-            };
-            if protected_label(&relative_owner) || apps.active_related(&relative_owner) {
                 continue;
             }
             if metadata.is_dir() {
@@ -1073,6 +1418,7 @@ pub fn scan(
         home: home.clone(),
         options: options.clone(),
         validated: HashMap::new(),
+        source_counts: HashMap::new(),
     };
     let logs = home.join("Library/Logs");
     if options.include_logs && !ctx.stopped && safe_root(&logs, &mut ctx) {
@@ -1122,6 +1468,10 @@ pub fn scan(
             for (root, rule) in [
                 (home.join("Library/Preferences"), Rule::OrphanPreference),
                 (
+                    home.join("Library/Saved Application State"),
+                    Rule::OrphanState,
+                ),
+                (
                     home.join("Library/Application Support"),
                     Rule::OrphanMetadata,
                 ),
@@ -1139,6 +1489,10 @@ pub fn scan(
                     let name = file_name(&child);
                     let id = match rule {
                         Rule::OrphanPreference => match name.strip_suffix(".plist") {
+                            Some(id) => id.to_string(),
+                            None => continue,
+                        },
+                        Rule::OrphanState => match name.strip_suffix(".savedState") {
                             Some(id) => id.to_string(),
                             None => continue,
                         },
@@ -1169,6 +1523,10 @@ pub fn scan(
             }
         }
     }
+    if options.include_caches && !ctx.stopped {
+        ctx.phase = "caches";
+        scan_extra_caches(&mut snapshot, &mut ctx, &apps);
+    }
     let caches = home.join("Library/Caches");
     if options.include_caches && !ctx.stopped && safe_root(&caches, &mut ctx) {
         ctx.phase = "caches";
@@ -1178,7 +1536,12 @@ pub fn scan(
                     break;
                 }
                 let owner = file_name(&child);
-                if owner.starts_with('.') || protected_label(&owner) || apps.active_related(&owner)
+                if owner.starts_with('.')
+                    || protected_label(&owner)
+                    || apps.active_related(&owner)
+                    || fixed_cache_sources(&home)
+                        .iter()
+                        .any(|(root, _)| root.starts_with(&child))
                 {
                     continue;
                 }
@@ -1186,40 +1549,17 @@ pub fn scan(
                     && apps.complete
                     && reverse_dns(&owner)
                     && apps.related(&owner).is_none();
-                let cutoff = ctx.cutoff;
-                match inventory(&child, Some(cutoff), false, &mut |path, file| {
-                    ctx.visit(path, file)
-                }) {
-                    Ok(prepared) => add_candidate(
-                        &mut snapshot,
-                        &mut ctx,
-                        &apps,
-                        &child,
-                        &caches,
-                        Rule::Cache,
-                        orphan.then_some(owner.clone()),
-                        &owner,
-                        Some(prepared),
-                    ),
-                    Err(WalkError::Fresh) => {
-                        // A recent sibling keeps its directory; only independently old files are offered.
-                        if fs::symlink_metadata(&child).is_ok_and(|metadata| {
-                            metadata.is_dir() && !metadata.file_type().is_symlink()
-                        }) {
-                            walk_files(
-                                &mut snapshot,
-                                &mut ctx,
-                                &apps,
-                                &caches,
-                                &child,
-                                Rule::Cache,
-                                &owner,
-                                orphan.then_some(owner.as_str()),
-                            );
-                        }
-                    }
-                    Err(error) => ctx.handle_walk_error(error),
-                }
+                walk_cache_branches(
+                    &mut snapshot,
+                    &mut ctx,
+                    &apps,
+                    &caches,
+                    &child,
+                    Rule::Cache,
+                    &owner,
+                    orphan.then_some(owner.as_str()),
+                    0,
+                );
             }
         }
     }
@@ -1246,10 +1586,17 @@ fn validate_item(
     }
     let allowed_root = match item.rule {
         Rule::Cache => snapshot.home.join("Library/Caches"),
+        Rule::RebuildableCache
+            if extra_root_allowed(&snapshot.home, &item.root, &item.owner_name) =>
+        {
+            item.root.clone()
+        }
+        Rule::RebuildableCache => return Err("缓存路径不在已知规则范围内。".into()),
         Rule::Log => snapshot.home.join("Library/Logs"),
         Rule::Installer => snapshot.home.join("Downloads"),
         Rule::OrphanPreference => snapshot.home.join("Library/Preferences"),
         Rule::OrphanMetadata => snapshot.home.join("Library/Application Support"),
+        Rule::OrphanState => snapshot.home.join("Library/Saved Application State"),
     };
     if item.root != allowed_root || item.path == item.root || !item.path.starts_with(&item.root) {
         return Err("路径不在扫描允许的清理范围内。".into());
@@ -1428,6 +1775,10 @@ fn cleanup_with_inventory(
 }
 
 #[cfg(test)]
+#[path = "scanner_coverage_tests.rs"]
+mod coverage_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
@@ -1498,10 +1849,12 @@ mod tests {
             let id = "fixture-1".to_string();
             let root = match rule {
                 Rule::Cache => self.home.join("Library/Caches"),
+                Rule::RebuildableCache => self.home.join(".npm/_cacache"),
                 Rule::Log => self.home.join("Library/Logs"),
                 Rule::Installer => self.home.join("Downloads"),
                 Rule::OrphanPreference => self.home.join("Library/Preferences"),
                 Rule::OrphanMetadata => self.home.join("Library/Application Support"),
+                Rule::OrphanState => self.home.join("Library/Saved Application State"),
             };
             let item = CleanupItem {
                 id: id.clone(),
@@ -1511,6 +1864,7 @@ mod tests {
                 risk: "low".into(),
                 bytes: manifest.bytes,
                 files: manifest.files,
+                is_directory: fingerprint.mode & 0o170_000 == 0o040_000,
                 modified_at: manifest.newest,
                 reason: "fixture".into(),
                 selected_by_default: true,
@@ -1542,6 +1896,7 @@ mod tests {
                 home: self.home.clone(),
                 options: ScanOptions::default(),
                 validated: HashMap::from([(id, validated)]),
+                source_counts: HashMap::new(),
             }
         }
     }

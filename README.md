@@ -4,7 +4,7 @@
 
 ## 下载与打开
 
-在 [GitHub Releases](https://github.com/dogeow/mac-sweep/releases/latest) 下载 `Mac-Sweep-v0.1.8-macos-arm64.zip`，解压后将 **Mac Sweep.app** 拖到「应用程序」文件夹并打开。
+在 [GitHub Releases](https://github.com/dogeow/mac-sweep/releases/latest) 下载 `Mac-Sweep-v0.1.9-macos-arm64.zip`，解压后将 **Mac Sweep.app** 拖到「应用程序」文件夹并打开。
 
 当前版本支持 **Apple Silicon Mac（M 系列芯片），macOS 12 或更新版本**。发布包使用本地 ad hoc 签名，没有 Apple Developer ID 签名或公证；macOS 可能阻止打开。若系统阻止运行，可先从源码构建。
 
@@ -43,6 +43,8 @@
 常看的目录可以收藏：点击文件夹行旁的星标，或进入目录后点击顶部「收藏」。侧栏「收藏目录」可以随时点击进入，重启应用后仍保留。已有统计会优先复用；首次打开或统计已过期时，也会先显示当前层的内容，未统计的目录大小显示「待分析」。点击「完整分析」才重新计算占用。点击收藏旁的 × 只取消收藏，不删除目录。
 
 ## 隐私与清理规则
+
+检查还涵盖已知的浏览器磁盘缓存、沙盒与 Electron 缓存、工具下载缓存和 Xcode 编译缓存；新增规则需手动确认。具体路径、参考的清理工具与保留内容见 [清理规则](docs/CLEANUP_RULES.md)。
 
 扫描与清理记录只保留在当前应用会话。收藏的目录路径单独保存在本机应用配置中，不保存扫描结果或上传文件。应用没有永久删除功能；清理未完成的项目会保留选择并显示原因，文件状态以 Finder 为准。疑似残留仅是线索，可能包含设置、聊天记录或其他个人文件。
 

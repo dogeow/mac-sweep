@@ -28,7 +28,7 @@
   const $ = (id) => document.getElementById(id);
   const escape = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
   const labels = { all: '所有项目', cache: '应用缓存', logs: '旧日志', installer: '安装包', orphan: '卸载后可能留下的文件' };
-  const explanations = { cache: '缓存是应用暂存的内容。清理后可能需要重新下载。', logs: '旧日志是应用运行和故障的记录。清理后无法查看这些旧记录。', installer: '这些是下载的安装文件。确认应用已安装，且不再需要安装包。', orphan: '没有找到对应应用。这些文件可能含有设置、文档或账户数据，请确认不再需要。' };
+  const explanations = { cache: '应用、浏览器和工具暂存的内容。清理后可能需要重新下载或编译，工具缓存请手动确认。', logs: '旧日志是应用运行和故障的记录。清理后无法查看这些旧记录。', installer: '这些是下载的安装文件。确认应用已安装，且不再需要安装包。', orphan: '没有找到对应应用。这些文件可能含有设置、文档或账户数据，请确认不再需要。' };
   const categories = ['cache', 'logs', 'installer', 'orphan'];
   const categoryIcons = { cache: 'layers', logs: 'file', installer: 'download', orphan: 'box' };
   const desktop = typeof window.__TAURI__?.core?.invoke === 'function' && typeof window.__TAURI__?.event?.listen === 'function';
@@ -167,7 +167,7 @@
       $('home-result-detail').textContent = state.report.cancelled ? '检查提前停止，结果可能不完整。可重新检查。' : state.moved.size ? '到废纸篓检查文件，自行清空后才会释放空间。' : '你也可以查看文件夹大小，找出空间用在哪里。';
     } else {
       $('home-result-summary').textContent = suggested.length ? `建议检查 ${bytes(sum(suggested))} 的内容` : '有些内容需要你确认';
-      $('home-result-detail').textContent = `${suggested.length ? '主要是旧缓存与日志。' : ''}${manual.length ? `另有 ${bytes(sum(manual))} 的安装包或应用数据，需要你确认。` : '查看说明，保留你还需要的内容。'}${state.report.cancelled ? ' 检查提前停止，这是部分结果。' : ''}`;
+      $('home-result-detail').textContent = `${suggested.length ? '主要是旧缓存与日志。' : ''}${manual.length ? `另有 ${bytes(sum(manual))} 的内容需要手动确认，可在结果中查看。` : '查看说明，保留你还需要的内容。'}${state.report.cancelled ? ' 检查提前停止，这是部分结果。' : ''}`;
     }
     if (!state.scanning && state.report && ((state.report.warnings || []).length || state.extraWarnings.length)) {
       $('home-result-detail').textContent += ' 检查过程中有提示，查看检查结果了解详情。';
@@ -182,7 +182,7 @@
   function renderCandidate(item, busy, depth) {
     const failure = state.failures.get(item.id);
     const infoOpen = state.expandedFileInfo.has(item.id);
-    return `<div class="tree-file${failure ? ' failed' : ''}" data-tree-depth="${Math.min(depth, 5)}"><div class="tree-file-row"><input type="checkbox" data-item-id="${escape(item.id)}" ${state.selected.has(item.id) ? 'checked' : ''} ${busy ? 'disabled' : ''} aria-label="选择 ${escape(item.name)}" /><span class="tree-file-icon">${icon('file')}</span><strong class="tree-file-name" title="${escape(item.name)}">${escape(item.name)}</strong>${failure ? '<span class="tree-failure-count">未能移动</span>' : ''}<span class="tree-file-size">${bytes(item.bytes)}</span><button class="tree-file-info-button" data-file-info="${escape(item.id)}" aria-expanded="${infoOpen}" aria-label="${infoOpen ? '收起' : '查看'} ${escape(item.name)} 的${failure ? '失败原因与' : ''}文件信息" title="${failure ? '查看失败原因与文件信息' : '查看文件信息'}" ${busy ? 'disabled' : ''}>${icon('info')}</button><button class="row-reveal" data-reveal-id="${escape(item.id)}" title="在 Finder 中显示此项目" aria-label="在 Finder 中显示 ${escape(item.name)}" ${!desktop || demo || busy ? 'disabled' : ''}>${icon('folder')}</button></div>${infoOpen ? `<div class="tree-file-info">${failure ? `<p class="tree-file-error">未能移动：${escape(failure)}</p>` : ''}<p>${escape(item.reason)}</p><code>${escape(item.path)}</code><p class="tree-file-meta">修改于 ${date(item.modifiedAt)} · ${Number(item.files || 0).toLocaleString()} 个文件</p></div>` : ''}</div>`;
+    return `<div class="tree-file${failure ? ' failed' : ''}" data-tree-depth="${Math.min(depth, 5)}"><div class="tree-file-row"><input type="checkbox" data-item-id="${escape(item.id)}" ${state.selected.has(item.id) ? 'checked' : ''} ${busy ? 'disabled' : ''} aria-label="选择 ${escape(item.name)}" /><span class="tree-file-icon">${icon(item.isDirectory ? 'folder' : 'file')}</span><strong class="tree-file-name" title="${escape(item.name)}">${escape(item.name)}</strong>${failure ? '<span class="tree-failure-count">未能移动</span>' : ''}<span class="tree-file-size">${bytes(item.bytes)}</span><button class="tree-file-info-button" data-file-info="${escape(item.id)}" aria-expanded="${infoOpen}" aria-label="${infoOpen ? '收起' : '查看'} ${escape(item.name)} 的${failure ? '失败原因与' : ''}文件信息" title="${failure ? '查看失败原因与文件信息' : '查看文件信息'}" ${busy ? 'disabled' : ''}>${icon('info')}</button><button class="row-reveal" data-reveal-id="${escape(item.id)}" title="在 Finder 中显示此项目" aria-label="在 Finder 中显示 ${escape(item.name)}" ${!desktop || demo || busy ? 'disabled' : ''}>${icon('folder')}</button></div>${infoOpen ? `<div class="tree-file-info">${failure ? `<p class="tree-file-error">未能移动：${escape(failure)}</p>` : ''}<p>${escape(item.reason)}</p><code>${escape(item.path)}</code><p class="tree-file-meta">修改于 ${date(item.modifiedAt)} · ${Number(item.files || 0).toLocaleString()} 个文件</p></div>` : ''}</div>`;
   }
   function renderTreeFiles(node, key, busy, depth) {
     if (!node.files.length) return '';
@@ -205,9 +205,9 @@
       const selected = cleanupModel.selectedState(group, state.selected);
       const failures = group.items.filter((item) => state.failures.has(item.id));
       const open = state.expanded.has(group.key);
-      const count = `${filtered ? '当前筛选 · ' : ''}${group.items.length.toLocaleString()} 项`;
+      const count = `${filtered ? '当前筛选 · ' : ''}${group.items.length.toLocaleString()} ${group.fileCount > group.items.length ? `处 · ${group.fileCount.toLocaleString()} 个文件` : '项'}`;
       const tree = open ? cleanupModel.buildDirectoryTree(group.items, state.sort) : [];
-      const directories = open ? `<div class="group-tree"><p class="group-tree-note">${escape(explanations[group.category] || '')} 目录大小只统计本次找到的内容，未列出的文件不会被清理。</p>${tree.map((node) => renderTreeDirectory(node, group, busy)).join('')}</div>` : '';
+      const directories = open ? `<div class="group-tree"><p class="group-tree-note">${escape(explanations[group.category] || '')} 仅处理本次列出的候选；整目录候选会包含其中全部子项。</p>${tree.map((node) => renderTreeDirectory(node, group, busy)).join('')}</div>` : '';
       return `<article class="cleanup-group${selected.count ? ' selected' : ''}${failures.length ? ' failed' : ''}"><div class="group-row"><input type="checkbox" data-group-id="${escape(group.key)}" ${selected.checked ? 'checked' : ''} ${busy || (!group.suggested && !open) ? 'disabled' : ''} aria-label="选择 ${escape(group.name)} 的全部 ${group.items.length} 个匹配项目" /><span class="group-icon ${escape(group.category)}">${icon(categoryIcons[group.category])}</span><div class="group-name"><strong>${escape(group.name)}</strong><span>${escape(labels[group.category] || group.category)} · ${count}</span></div>${!group.suggested ? '<span class="group-badge review">需确认</span>' : ''}<strong class="group-size">${bytes(group.bytes)}</strong></div>${failures.length ? `<p class="group-error">${failures.length} 项未能移动，展开查看原因</p>` : ''}<details class="group-details" data-group-details="${escape(group.key)}" ${open ? 'open' : ''}><summary title="${open ? '收起' : '查看'} ${escape(group.name)} 的目录" aria-label="${open ? '收起' : '查看'} ${escape(group.name)} 的目录" aria-disabled="${busy}"><span class="sr-only">查看目录</span><span class="group-chevron">${icon('chevron-down')}</span></summary>${directories}</details></article>`;
     }).join('');
     $('result-rows').querySelectorAll('[data-tree-depth]').forEach((element) => {

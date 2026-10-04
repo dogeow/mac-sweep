@@ -165,3 +165,46 @@ test('similar prefixes and separate user roots never merge their candidate IDs',
   assert.deepEqual(selected, new Set(['codex']));
   assert.equal(roots.reduce((bytes, node) => bytes + node.bytes, 0), groupItems(files)[0].bytes);
 });
+
+test('npm Cargo and sandbox cache branches share their exact cache roots without losing IDs or bytes', () => {
+  const cases = [
+    {
+      root: '/Users/example/.npm/_cacache',
+      files: ['content-v2/sha512/01/first', 'content-v2/sha512/ff/second', 'index-v5/ab/third'],
+    },
+    {
+      root: '/Users/example/.cargo/registry/cache',
+      files: ['index.crates.io-aaaa/first.crate', 'index.crates.io-bbbb/second.crate'],
+    },
+    {
+      root: '/Users/example/Library/Containers/com.fixture.app/Data/Library/Caches',
+      files: ['downloads/first.cache', 'compiled/second.cache'],
+    },
+  ];
+  const allItems = [];
+  for (const [source, fixture] of cases.entries()) {
+    const files = fixture.files.map((relative, index) => item(`source-${source}-${index}`, {
+      appName: null, path: `${fixture.root}/${relative}`, files: 1,
+      bytes: (source + 1) * 100 + index, selectedByDefault: false, risk: 'review',
+    }));
+    allItems.push(...files);
+    const groups = groupItems(files);
+    assert.equal(groups.length, 1);
+    const roots = buildDirectoryTree(files);
+    assert.equal(roots.length, 1);
+    const root = roots[0];
+    assert.equal(root.path, fixture.root);
+    assert.equal(root.paths[0], fixture.root);
+    assert.equal(root.candidateCount, files.length);
+    assert.equal(root.fileCount, files.length);
+    assert.equal(root.bytes, files.reduce((bytes, file) => bytes + file.bytes, 0));
+    assert.equal(root.bytes, groups[0].bytes);
+    assert.deepEqual(new Set(root.itemIds), new Set(files.map((file) => file.id)));
+    root.items.forEach((file) => assert.strictEqual(file, files.find((original) => original.id === file.id)));
+  }
+  const roots = buildDirectoryTree(allItems);
+  assert.equal(roots.length, 3);
+  assert.deepEqual(new Set(roots.map((root) => root.path)), new Set(cases.map((fixture) => fixture.root)));
+  assert.deepEqual(new Set(roots.flatMap((root) => root.itemIds)), new Set(allItems.map((file) => file.id)));
+  assert.equal(roots.reduce((bytes, root) => bytes + root.bytes, 0), allItems.reduce((bytes, file) => bytes + file.bytes, 0));
+});
