@@ -109,6 +109,7 @@ pub struct CleanupResult {
     pub path: String,
     pub bytes: u64,
     pub error: Option<String>,
+    pub outcome: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -125,6 +126,13 @@ pub struct ScanSnapshot {
     options: ScanOptions,
     validated: HashMap<String, ValidatedItem>,
     source_counts: HashMap<(String, String), usize>,
+    cleanup_uncertain: bool,
+}
+
+impl ScanSnapshot {
+    pub(crate) fn invalidate_cleanup(&mut self) {
+        self.cleanup_uncertain = true;
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -214,12 +222,55 @@ struct AppInventory {
     apps: Vec<InstalledApp>,
     complete: bool,
     active_paths: HashSet<PathBuf>,
+    active_apps: Vec<InstalledApp>,
     active_complete: bool,
 }
 
 impl AppInventory {
     fn related(&self, id: &str) -> Option<&InstalledApp> {
-        self.apps.iter().find(|app| bundle_related(&app.id, id))
+        if let Some(exact) = self.apps.iter().find(|app| app.id.eq_ignore_ascii_case(id)) {
+            return Some(exact);
+        }
+        let mut matches = self
+            .apps
+            .iter()
+            .filter(|app| bundle_hierarchically_related(&app.id, id));
+        let first = matches.next()?;
+        // Multiple copies of one bundle ID still identify the same owner. Two
+        // different hierarchical IDs do not establish one application owner.
+        if matches.any(|app| !app.id.eq_ignore_ascii_case(&first.id)) {
+            None
+        } else {
+            Some(first)
+        }
+    }
+
+    fn has_possible_owner(&self, id: &str) -> bool {
+        self.apps
+            .iter()
+            .chain(&self.active_apps)
+            .any(|app| bundle_related(&app.id, id))
+    }
+
+    fn owner_uncertain(&self, id: &str) -> bool {
+        self.related(id).is_none() && self.has_possible_owner(id)
+    }
+
+    fn refresh_active_paths(&mut self, running: HashSet<PathBuf>) -> Result<(), String> {
+        self.active_paths = running;
+        self.active_apps.clear();
+        self.active_complete = false;
+        for path in &self.active_paths {
+            let app = read_app_metadata(path).map_err(|error| {
+                format!(
+                    "无法识别正在运行的应用 {}：{error}。暂不能安全确认清理。",
+                    path.display()
+                )
+            })?;
+            self.active_apps.push(app);
+        }
+        self.active_complete = true;
+        Ok(())
     }
 
     fn active_related(&self, label: &str) -> bool {
@@ -228,9 +279,13 @@ impl AppInventory {
             let active_name = normalized_name(&file_name(path));
             active_name == normalized
                 || active_name == normalized_name(label.rsplit('.').next().unwrap_or(label))
+        }) || self.active_apps.iter().any(|app| {
+            bundle_hierarchically_related(&app.id, label)
+                || normalized == normalized_name(&app.name)
+                || normalized == normalized_name(&file_name(&app.path))
         }) || self.apps.iter().any(|app| {
             self.active_paths.contains(&app.path)
-                && (bundle_related(&app.id, label)
+                && (bundle_hierarchically_related(&app.id, label)
                     || normalized == normalized_name(&app.name)
                     || normalized == normalized_name(&file_name(&app.path)))
         })
@@ -335,11 +390,28 @@ fn file_name(path: &Path) -> String {
 }
 
 fn normalized_name(name: &str) -> String {
-    name.trim_end_matches(".app")
+    app_name_without_extension(name)
         .chars()
         .filter(|character| character.is_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect()
+}
+
+fn app_name_without_extension(name: &str) -> &str {
+    if name
+        .get(name.len().saturating_sub(4)..)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(".app"))
+    {
+        &name[..name.len() - 4]
+    } else {
+        name
+    }
+}
+
+fn is_app_bundle(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
 }
 
 fn reverse_dns(id: &str) -> bool {
@@ -354,16 +426,25 @@ fn reverse_dns(id: &str) -> bool {
         && labels[0].bytes().all(|byte| byte.is_ascii_alphabetic())
 }
 
-// Shared vendor identifiers are ambiguous: a sibling app can still own the data.
-fn bundle_related(left: &str, right: &str) -> bool {
+fn bundle_hierarchically_related(left: &str, right: &str) -> bool {
     let left = left.to_ascii_lowercase();
     let right = right.to_ascii_lowercase();
     left == right
         || left.starts_with(&format!("{right}."))
         || right.starts_with(&format!("{left}."))
-        || (reverse_dns(&left)
-            && reverse_dns(&right)
-            && left.split('.').take(2).eq(right.split('.').take(2)))
+}
+
+// Shared vendor identifiers are ambiguous. They veto absence-based orphan
+// inference, but must never supply display ownership or merge application groups.
+fn bundle_related(left: &str, right: &str) -> bool {
+    bundle_hierarchically_related(left, right)
+        || (reverse_dns(left)
+            && reverse_dns(right)
+            && left
+                .split('.')
+                .take(2)
+                .map(str::to_ascii_lowercase)
+                .eq(right.split('.').take(2).map(str::to_ascii_lowercase)))
 }
 
 fn protected_label(label: &str) -> bool {
@@ -579,17 +660,10 @@ fn cache_display_name(owner: &str) -> String {
     }
 }
 
-fn protected_content_file(path: &Path, allow_app_state: bool) -> bool {
-    if allow_app_state
-        && matches!(
-            path.extension().and_then(|extension| extension.to_str()),
-            Some("db" | "sqlite" | "sqlite3")
-        )
-    {
-        protected_label(&file_name(path))
-    } else {
-        protected_file(path)
-    }
+fn protected_content_file(path: &Path, _allow_app_state: bool) -> bool {
+    // Manual review does not relax browser/account/database protections for
+    // application support directories whose installed owner cannot be found.
+    protected_file(path)
 }
 
 fn is_installer(path: &Path) -> bool {
@@ -818,41 +892,260 @@ fn disk_info(path: &Path) -> Result<DiskInfo, String> {
 fn running_app_paths() -> Result<HashSet<PathBuf>, String> {
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("/bin/ps")
-            .args(["-axo", "comm="])
-            .output()
-            .map_err(|error| format!("无法读取正在运行的应用：{error}"))?;
-        if !output.status.success() {
-            return Err("无法读取正在运行的应用，暂不能安全确认清理。".into());
+        let mut paths =
+            bundle_paths_from_processes(current_user_process_ids()?, native_process_executable)?;
+        // Public NSWorkspaceRunningApplications is explicitly thread-safe.
+        // Its bundle URLs also cover GUI bundles backed by an external script
+        // interpreter; the kernel inventory covers unregistered app executables.
+        let applications = objc2_app_kit::NSWorkspace::sharedWorkspace().runningApplications();
+        if applications.len() > 16_384 {
+            return Err("系统应用清单超出安全上限，暂不能确认清理。".into());
         }
-        {
-            Ok(String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .filter_map(|line| {
-                    let command = line.trim();
-                    command
-                        .find(".app/")
-                        .map(|end| PathBuf::from(&command[..end + 4]))
-                })
-                .collect())
+        for application in applications.iter() {
+            if application.isTerminated() {
+                continue;
+            }
+            match application.bundleURL() {
+                Some(url) if url.isFileURL() => {
+                    let path = unsafe {
+                        std::ffi::CStr::from_ptr(url.fileSystemRepresentation().as_ptr())
+                    };
+                    use std::os::unix::ffi::OsStrExt;
+                    let path = PathBuf::from(std::ffi::OsStr::from_bytes(path.to_bytes()));
+                    if !path.is_absolute() {
+                        return Err("系统返回的应用位置无效，暂不能确认清理。".into());
+                    }
+                    paths.insert(path);
+                }
+                None if application.bundleIdentifier().is_none() => {}
+                _ => return Err("无法完整取得正在运行应用的位置，暂不能确认清理。".into()),
+            }
         }
+        Ok(paths)
     }
     #[cfg(not(target_os = "macos"))]
     Ok(HashSet::new())
 }
 
-fn app_inventory<F: Fn(ScanProgress)>(home: &Path, ctx: &mut Context<'_, F>) -> AppInventory {
-    let running = running_app_paths();
-    if let Err(error) = &running {
-        ctx.warn(format!("{error}。已取消所有候选的默认勾选。"));
+fn app_bundle_from_executable(path: &Path) -> Result<Option<PathBuf>, String> {
+    if !path.is_absolute() {
+        return Err("系统返回的进程路径不是绝对路径，暂不能安全确认清理。".into());
     }
-    let active_complete = running.is_ok();
+    let mut bundle = PathBuf::new();
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
+        if matches!(component, Component::CurDir | Component::ParentDir) {
+            return Err("系统返回的进程路径包含不明确组件，暂不能安全确认清理。".into());
+        }
+        bundle.push(component.as_os_str());
+        if is_app_bundle(&bundle) {
+            if components.peek().is_none() {
+                return Err("系统返回的应用进程路径不完整，暂不能安全确认清理。".into());
+            }
+            return Ok(Some(bundle));
+        }
+    }
+    Ok(None)
+}
+
+fn bundle_paths_from_processes(
+    pids: impl IntoIterator<Item = i32>,
+    executable: impl Fn(i32) -> Result<Option<PathBuf>, String>,
+) -> Result<HashSet<PathBuf>, String> {
+    let mut paths = HashSet::new();
+    for pid in pids {
+        if let Some(path) = executable(pid)? {
+            if let Some(bundle) = app_bundle_from_executable(&path)? {
+                paths.insert(bundle);
+            }
+        }
+    }
+    Ok(paths)
+}
+
+#[cfg(target_os = "macos")]
+fn current_user_process_ids() -> Result<HashSet<i32>, String> {
+    // Public SDK sys/proc_info.h selectors; libc exports the functions but not
+    // these selectors. Include real-UID processes so sudo-launched helpers also
+    // remain relevant to this user's home-directory cleanup.
+    const PROC_UID_ONLY: u32 = 4;
+    const PROC_RUID_ONLY: u32 = 5;
+    const MAX_ACTIVE_PIDS: usize = 16_384;
+    let mut pids = HashSet::new();
+    // SAFETY: getuid/geteuid take no arguments and have no memory preconditions.
+    let (uid, ruid) = unsafe { (libc::geteuid(), libc::getuid()) };
+    for (selector, owner) in [(PROC_UID_ONLY, uid), (PROC_RUID_ONLY, ruid)] {
+        let mut buffer = vec![0_i32; MAX_ACTIVE_PIDS];
+        let capacity = std::mem::size_of_val(buffer.as_slice());
+        // SAFETY: buffer points to capacity bytes of writable i32 storage.
+        let bytes = unsafe {
+            libc::proc_listpids(selector, owner, buffer.as_mut_ptr().cast(), capacity as i32)
+        };
+        if bytes <= 0
+            || bytes as usize >= capacity
+            || !(bytes as usize).is_multiple_of(std::mem::size_of::<i32>())
+        {
+            return Err("无法完整读取当前用户的进程清单，暂不能安全确认清理。".into());
+        }
+        pids.extend(
+            buffer[..bytes as usize / std::mem::size_of::<i32>()]
+                .iter()
+                .copied()
+                .filter(|pid| *pid > 0),
+        );
+    }
+    if !pids.contains(&(std::process::id() as i32)) {
+        return Err("当前用户的进程清单不完整，暂不能安全确认清理。".into());
+    }
+    Ok(pids)
+}
+
+#[cfg(target_os = "macos")]
+fn native_process_info(pid: i32) -> Result<Option<libc::proc_bsdinfo>, String> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    // SAFETY: info is aligned, writable storage for exactly size bytes.
+    let bytes = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size as i32,
+        )
+    };
+    if bytes != size as i32 {
+        let error = io::Error::last_os_error();
+        if bytes == 0 && error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(None); // The process exited between enumeration and lookup.
+        }
+        return Err(format!(
+            "无法验证用户进程 {pid}：{error}。暂不能安全确认清理。"
+        ));
+    }
+    // SAFETY: proc_pidinfo returned the full initialized structure.
+    let info = unsafe { info.assume_init() };
+    if info.pbi_pid != pid as u32 {
+        return Err("系统返回的进程标识不一致，暂不能安全确认清理。".into());
+    }
+    Ok(Some(info))
+}
+
+#[cfg(target_os = "macos")]
+fn native_process_path(pid: i32) -> Result<PathBuf, io::Error> {
+    let mut buffer = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: buffer points to the API's maximum-size writable byte array.
+    let bytes = unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+    if bytes <= 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let length = bytes as usize;
+    if length >= buffer.len() || buffer[length] != 0 || buffer[..length].contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "系统进程路径不完整。",
+        ));
+    }
+    // Kernel path bytes, rather than argv[0] or line-delimited ps output. Preserve
+    // non-UTF-8 names and newlines so they cannot hide an active app bundle.
+    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(
+        &buffer[..length],
+    )))
+}
+
+#[cfg(target_os = "macos")]
+fn native_process_executable(pid: i32) -> Result<Option<PathBuf>, String> {
+    let Some(before) = native_process_info(pid)? else {
+        return Ok(None);
+    };
+    // SAFETY: getuid/geteuid take no arguments and have no memory preconditions.
+    let (uid, ruid) = unsafe { (libc::geteuid(), libc::getuid()) };
+    if before.pbi_status == libc::SZOMB || (before.pbi_uid != uid && before.pbi_ruid != ruid) {
+        return Ok(None);
+    }
+    let path = native_process_path(pid);
+    let Some(after) = native_process_info(pid)? else {
+        return Ok(None);
+    };
+    if after.pbi_status == libc::SZOMB {
+        return Ok(None);
+    }
+    if (
+        before.pbi_start_tvsec,
+        before.pbi_start_tvusec,
+        before.pbi_uid,
+        before.pbi_ruid,
+    ) != (
+        after.pbi_start_tvsec,
+        after.pbi_start_tvusec,
+        after.pbi_uid,
+        after.pbi_ruid,
+    ) {
+        return Err("进程在应用验证期间发生变化，暂不能安全确认清理。".into());
+    }
+    path.map(Some).map_err(|error| {
+        format!("无法读取用户进程 {pid} 的真实执行路径：{error}。暂不能安全确认清理。")
+    })
+}
+
+fn read_app_metadata(path: &Path) -> Result<InstalledApp, String> {
+    if !path.is_absolute() {
+        return Err("应用路径不是绝对路径。".into());
+    }
+    // Active applications may live outside the installed inventory roots or be
+    // launched through a symlink. Resolve only this OS-reported bundle, then
+    // verify its actual Info.plist without traversing a symlinked Contents tree.
+    let bundle = fs::canonicalize(path).map_err(|error| error.to_string())?;
+    let info = bundle.join("Contents/Info.plist");
+    let ancestors = safe_ancestors(info.parent().ok_or("应用元数据路径无效。")?)?;
+    let before = fs::symlink_metadata(&info).map_err(|error| error.to_string())?;
+    if !before.is_file() || before.file_type().is_symlink() || before.len() >= 4 * 1024 * 1024 {
+        return Err("应用元数据不是可验证的普通文件。".into());
+    }
+    let plist = plist::Value::from_file(&info).map_err(|error| error.to_string())?;
+    let dictionary = plist.as_dictionary().ok_or("应用元数据格式无效。")?;
+    let id = dictionary
+        .get("CFBundleIdentifier")
+        .and_then(plist::Value::as_string)
+        .filter(|id| !id.trim().is_empty())
+        .ok_or("应用没有可验证的标识。")?;
+    let name = dictionary
+        .get("CFBundleDisplayName")
+        .or_else(|| dictionary.get("CFBundleName"))
+        .and_then(plist::Value::as_string)
+        .map(str::to_owned)
+        .unwrap_or_else(|| app_name_without_extension(&file_name(path)).to_string());
+    let after = fs::symlink_metadata(&info).map_err(|error| error.to_string())?;
+    if Fingerprint::of(&before) != Fingerprint::of(&after)
+        || safe_ancestors(info.parent().ok_or("应用元数据路径无效。")?)? != ancestors
+        || fs::canonicalize(path).map_err(|error| error.to_string())? != bundle
+    {
+        return Err("应用元数据在读取期间发生变化。".into());
+    }
+    Ok(InstalledApp {
+        id: id.into(),
+        name,
+        path: bundle,
+    })
+}
+
+fn app_inventory<F: Fn(ScanProgress)>(home: &Path, ctx: &mut Context<'_, F>) -> AppInventory {
     let mut result = AppInventory {
         apps: Vec::new(),
         complete: true,
-        active_paths: running.unwrap_or_default(),
-        active_complete,
+        active_paths: HashSet::new(),
+        active_apps: Vec::new(),
+        active_complete: false,
     };
+    if ctx.cancel.load(Ordering::Relaxed) || ctx.stopped {
+        ctx.stopped = true;
+        result.complete = false;
+        return result;
+    }
+    let running = running_app_paths();
+    if let Err(error) = running.and_then(|paths| result.refresh_active_paths(paths)) {
+        ctx.warn(format!("{error}。已取消所有候选的默认勾选。"));
+    }
     for root in [
         PathBuf::from("/Applications"),
         home.join("Applications"),
@@ -892,9 +1185,7 @@ fn app_inventory<F: Fn(ScanProgress)>(home: &Path, ctx: &mut Context<'_, F>) -> 
                 };
                 if metadata.file_type().is_symlink() {
                     // A symlinked application makes absence-based identification uncertain.
-                    if child
-                        .extension()
-                        .is_some_and(|extension| extension == "app")
+                    if is_app_bundle(&child)
                         && !child.starts_with("/System")
                         && !protected_label(&file_name(&child))
                     {
@@ -909,42 +1200,9 @@ fn app_inventory<F: Fn(ScanProgress)>(home: &Path, ctx: &mut Context<'_, F>) -> 
                 if !metadata.is_dir() {
                     continue;
                 }
-                if child
-                    .extension()
-                    .is_some_and(|extension| extension == "app")
-                {
-                    let info = child.join("Contents/Info.plist");
-                    let valid_info = fs::symlink_metadata(&info).is_ok_and(|metadata| {
-                        metadata.is_file()
-                            && !metadata.file_type().is_symlink()
-                            && metadata.len() < 4 * 1024 * 1024
-                    });
-                    let plist = if valid_info {
-                        plist::Value::from_file(&info).ok()
-                    } else {
-                        None
-                    };
-                    let dictionary = plist.as_ref().and_then(plist::Value::as_dictionary);
-                    let id = dictionary
-                        .and_then(|dictionary| dictionary.get("CFBundleIdentifier"))
-                        .and_then(plist::Value::as_string);
-                    if let Some(id) = id {
-                        let name = dictionary
-                            .and_then(|dictionary| {
-                                dictionary
-                                    .get("CFBundleDisplayName")
-                                    .or_else(|| dictionary.get("CFBundleName"))
-                            })
-                            .and_then(plist::Value::as_string)
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| {
-                                file_name(&child).trim_end_matches(".app").to_string()
-                            });
-                        result.apps.push(InstalledApp {
-                            id: id.to_string(),
-                            name,
-                            path: child,
-                        });
+                if is_app_bundle(&child) {
+                    if let Ok(app) = read_app_metadata(&child) {
+                        result.apps.push(app);
                     } else if !child.starts_with("/System") && !protected_label(&file_name(&child))
                     {
                         result.complete = false;
@@ -980,7 +1238,13 @@ fn add_candidate<F: Fn(ScanProgress)>(
         || apps.active_related(owner_name)
         || orphan_id
             .as_ref()
-            .is_some_and(|id| !apps.complete || apps.related(id).is_some())
+            .is_some_and(|id| !apps.complete || apps.has_possible_owner(id))
+        || snapshot.validated.values().any(|item| {
+            // Sources can overlap even across categories (for example an orphan
+            // support directory and its known cache subtree). Keep selections
+            // disjoint so selecting a parent cannot silently include another row.
+            item.path.starts_with(path) || path.starts_with(&item.path)
+        })
         || source_full(snapshot, ctx, rule, owner_name, orphan_id.as_deref())
     {
         return;
@@ -1017,6 +1281,7 @@ fn add_candidate<F: Fn(ScanProgress)>(
     };
     let runtime_cache = matches!(rule, Rule::Cache) && runtime_cache_label(owner_name);
     let review = !apps.active_complete
+        || apps.owner_uncertain(owner_name)
         || extra_cache
         || runtime_cache
         || orphan_id.is_some()
@@ -1030,11 +1295,13 @@ fn add_candidate<F: Fn(ScanProgress)>(
     } else if matches!(rule, Rule::OrphanState) {
         "疑似已卸载应用留下的窗口恢复状态。未找到同标识或同开发者的应用并不证明已经卸载，可能影响恢复上次打开的窗口；需手动确认。"
     } else if matches!(rule, Rule::OrphanMetadata) {
-        "旧应用数据文件夹：未在常见应用目录找到同标识或同开发者的应用，但这不证明已经卸载。可能包含设置、数据库、聊天记录和个人文件，必须打开查看并手动确认。"
+        "旧应用数据文件夹：未在常见应用目录找到同标识或同开发者的应用，但这不证明已经卸载。已避开已知数据库、账号状态、模型与游戏数据，其他设置和个人文件仍必须打开查看并手动确认。"
     } else if orphan_id.is_some() {
         "未在常见应用目录找到同标识或同开发者的应用；这不证明已经卸载，可能属于便携应用或后台组件。仅列出旧缓存或偏好元数据，需手动核对。"
     } else if runtime_cache {
         "开发工具或浏览器自动化的运行时缓存，可能仍被项目引用、用于离线工作或运行程序。即使时间较旧也需要手动核对，清理后可能重新下载。"
+    } else if apps.owner_uncertain(owner_name) {
+        "存在相关标识或同开发者的应用，但无法确认此项目所属的应用。仅列出超过保留天数的缓存或日志；必须手动核对，不能依据应用分组判断可清理。"
     } else {
         match rule {
             Rule::Cache => "位于用户缓存目录，候选文件及所有子项均超过保留天数；已避开浏览器状态、数据库、模型与游戏数据。应用下次使用时可能重新生成。",
@@ -1420,6 +1687,7 @@ pub fn scan(
         options: options.clone(),
         validated: HashMap::new(),
         source_counts: HashMap::new(),
+        cleanup_uncertain: false,
     };
     let logs = home.join("Library/Logs");
     if options.include_logs && !ctx.stopped && safe_root(&logs, &mut ctx) {
@@ -1499,7 +1767,7 @@ pub fn scan(
                         },
                         _ => name.clone(),
                     };
-                    if !reverse_dns(&id) || protected_label(&id) || apps.related(&id).is_some() {
+                    if !reverse_dns(&id) || protected_label(&id) || apps.has_possible_owner(&id) {
                         continue;
                     }
                     if matches!(rule, Rule::OrphanPreference)
@@ -1549,7 +1817,7 @@ pub fn scan(
                 let orphan = options.include_orphans
                     && apps.complete
                     && reverse_dns(&owner)
-                    && apps.related(&owner).is_none();
+                    && !apps.has_possible_owner(&owner);
                 walk_cache_branches(
                     &mut snapshot,
                     &mut ctx,
@@ -1606,7 +1874,7 @@ fn validate_item(
         return Err("关联应用正在运行，请退出应用后重新扫描。".into());
     }
     if let Some(id) = &item.orphan_id {
-        if !apps.complete || apps.related(id).is_some() {
+        if !apps.complete || apps.has_possible_owner(id) {
             return Err("应用清单已变化或无法完整确认，已保留疑似残留；请重新扫描。".into());
         }
     }
@@ -1644,34 +1912,20 @@ fn validate_item(
     Ok(())
 }
 
-pub(crate) fn native_trash(path: &Path) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        use trash::macos::{DeleteMethod, TrashContextExtMacos};
-        let mut context = trash::TrashContext::default();
-        context.set_delete_method(DeleteMethod::NsFileManager);
-        context
-            .delete(path)
-            .map_err(|error| format!("无法移入废纸篓：{error}"))
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = path;
-        Err("此清理功能仅支持 macOS 原生废纸篓。".into())
-    }
-}
-
 pub fn cleanup(
     snapshot: &mut ScanSnapshot,
     ids: &[String],
     progress: impl Fn(CleanupProgress),
 ) -> Result<CleanupReport, String> {
+    if snapshot.cleanup_uncertain {
+        return Err("上次清理结果未确认，请先检查 Finder 并重新扫描。".into());
+    }
     let apps = current_app_inventory(&snapshot.home);
     cleanup_with_inventory(
         snapshot,
         ids,
         progress,
-        native_trash,
+        crate::native_trash::move_recorded,
         apps,
         running_app_paths,
     )
@@ -1700,10 +1954,17 @@ fn cleanup_with_inventory(
     snapshot: &mut ScanSnapshot,
     ids: &[String],
     progress: impl Fn(CleanupProgress),
-    trash_item: impl Fn(&Path) -> Result<(), String>,
+    trash_item: impl Fn(
+        &Path,
+        u64,
+        u64,
+    ) -> Result<crate::native_trash::Receipt, crate::native_trash::MoveError>,
     mut apps: AppInventory,
     refresh_running: impl Fn() -> Result<HashSet<PathBuf>, String>,
 ) -> Result<CleanupReport, String> {
+    if snapshot.cleanup_uncertain {
+        return Err("上次清理结果未确认，请先检查 Finder 并重新扫描。".into());
+    }
     if ids.len() > MAX_ITEMS {
         return Err("单次清理项目过多，请重新扫描。".into());
     }
@@ -1737,23 +1998,33 @@ fn cleanup_with_inventory(
         });
         // Applications may start during a batch. Refresh before each filesystem validation.
         let validation = refresh_running().and_then(|running| {
-            apps.active_paths = running;
-            apps.active_complete = true;
+            apps.refresh_active_paths(running)?;
             validate_item(snapshot, &item, &apps)
         });
         let outcome = validation
-            .and_then(|()| trash_item(&item.path))
-            .and_then(|()| match fs::symlink_metadata(&item.path) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-                Ok(metadata) if Identity::of(&metadata) != item.fingerprint.identity => Ok(()),
-                Ok(_) => Err("原文件仍在原路径，未能确认移入废纸篓；已保留结果。".into()),
-                Err(error) => Err(format!("移动后无法验证原路径：{error}")),
+            .map_err(crate::native_trash::MoveError::failed)
+            .and_then(|()| {
+                let identity = item.fingerprint.identity;
+                let receipt = trash_item(&item.path, identity.device, identity.inode)?;
+                if receipt.matches(identity.device, identity.inode) {
+                    Ok(())
+                } else {
+                    Err(crate::native_trash::MoveError {
+                        message: "移动回执与原文件不符，请检查原位置与废纸篓。".into(),
+                        unknown: true,
+                    })
+                }
             });
         let result = CleanupResult {
             id: (*id).clone(),
             path: item.path.to_string_lossy().into_owned(),
             bytes: item.manifest.bytes,
-            error: outcome.as_ref().err().cloned(),
+            error: outcome.as_ref().err().map(|error| error.message.clone()),
+            outcome: match &outcome {
+                Ok(_) => "moved",
+                Err(error) if error.unknown => "unknown",
+                Err(_) => "failed",
+            },
         };
         if outcome.is_ok() {
             snapshot.validated.remove(id.as_str());
@@ -1761,6 +2032,9 @@ fn cleanup_with_inventory(
             report.bytes_moved = report.bytes_moved.saturating_add(result.bytes);
             report.moved.push(result);
         } else {
+            if result.outcome == "unknown" {
+                snapshot.invalidate_cleanup();
+            }
             report.failed.push(result);
         }
         progress(CleanupProgress {
@@ -1790,9 +2064,24 @@ mod tests {
         progress: impl Fn(CleanupProgress),
         trash_item: impl Fn(&Path) -> Result<(), String>,
     ) -> Result<CleanupReport, String> {
-        cleanup_with_inventory(snapshot, ids, progress, trash_item, no_apps(), || {
-            Ok(HashSet::new())
-        })
+        cleanup_with_inventory(
+            snapshot,
+            ids,
+            progress,
+            |path, device, inode| {
+                trash_item(path)?;
+                if fs::symlink_metadata(path).is_ok() {
+                    return Err("fixture source still exists".into());
+                }
+                Ok(crate::native_trash::Receipt {
+                    destination: PathBuf::from("/test-trash/fixture"),
+                    device,
+                    inode,
+                })
+            },
+            no_apps(),
+            || Ok(HashSet::new()),
+        )
     }
 
     struct Fixture {
@@ -1898,6 +2187,7 @@ mod tests {
                 options: ScanOptions::default(),
                 validated: HashMap::from([(id, validated)]),
                 source_counts: HashMap::new(),
+                cleanup_uncertain: false,
             }
         }
     }
@@ -1912,6 +2202,7 @@ mod tests {
             apps: vec![],
             complete: true,
             active_paths: HashSet::new(),
+            active_apps: vec![],
             active_complete: true,
         }
     }
@@ -1999,7 +2290,11 @@ mod tests {
         assert!(inventory(&path, None, true, &mut |_, _| Ok(())).is_ok());
         fixture.file("Library/Application Support/com.vendor.deleted/documents.json");
         fixture.file("Library/Application Support/com.vendor.deleted/state.sqlite");
-        assert!(inventory(&path, None, true, &mut |_, _| Ok(())).is_ok());
+        assert!(matches!(
+            inventory(&path, None, true, &mut |_, _| Ok(())),
+            Err(WalkError::Protected)
+        ));
+        fs::remove_file(path.join("state.sqlite")).unwrap();
         fixture.file("Library/Application Support/com.vendor.deleted/weights.safetensors");
         assert!(matches!(
             inventory(&path, None, true, &mut |_, _| Ok(())),
@@ -2142,7 +2437,14 @@ mod tests {
             &mut snapshot,
             &["fixture-1".into(), "fixture-2".into()],
             |_| {},
-            |path| fs::rename(path, &destination).map_err(|error| error.to_string()),
+            |path, device, inode| {
+                fs::rename(path, &destination).map_err(|error| error.to_string())?;
+                Ok(crate::native_trash::Receipt {
+                    destination: destination.clone(),
+                    device,
+                    inode,
+                })
+            },
             no_apps(),
             || {
                 let refresh = refreshes.get();
@@ -2163,9 +2465,9 @@ mod tests {
             &mut snapshot,
             &["fixture-2".into()],
             |_| {},
-            |_| {
+            |_, _, _| {
                 called.set(true);
-                Ok(())
+                unreachable!("running inventory failed before mutation")
             },
             no_apps(),
             || Err("process permission denied".into()),
@@ -2174,6 +2476,60 @@ mod tests {
         assert_eq!(failed.failed.len(), 1);
         assert!(!called.get());
         assert!(second.exists());
+    }
+
+    #[test]
+    fn unconfirmed_native_receipts_preserve_candidates_without_claiming_failure_or_success() {
+        let fixture = Fixture::new();
+        let file = fixture.file("Library/Logs/unconfirmed.log");
+        let mut snapshot = fixture.snapshot_for(&file, Rule::Log);
+        let report = cleanup_with_inventory(
+            &mut snapshot,
+            &["fixture-1".into()],
+            |_| {},
+            |_, _, _| {
+                Err(crate::native_trash::MoveError {
+                    message: "receipt unavailable".into(),
+                    unknown: true,
+                })
+            },
+            no_apps(),
+            || Ok(HashSet::new()),
+        )
+        .unwrap();
+        assert!(report.moved.is_empty());
+        assert_eq!(report.failed[0].outcome, "unknown");
+        assert_eq!(report.bytes_moved, 0);
+        assert_eq!(snapshot.report.items.len(), 1);
+        assert!(cleanup_with_inventory(
+            &mut snapshot,
+            &["fixture-1".into()],
+            |_| {},
+            |_, _, _| panic!("unknown results cannot be retried"),
+            no_apps(),
+            || panic!("no inventory refresh before refusing a retry")
+        )
+        .unwrap_err()
+        .contains("重新扫描"));
+        // A newly committed scan is the only way to replace uncertainty.
+        let mut snapshot = fixture.snapshot_for(&file, Rule::Log);
+        let report = cleanup_with_inventory(
+            &mut snapshot,
+            &["fixture-1".into()],
+            |_| {},
+            |_, device, inode| {
+                Ok(crate::native_trash::Receipt {
+                    destination: fixture.home.join("wrong-receipt"),
+                    device,
+                    inode: inode + 1,
+                })
+            },
+            no_apps(),
+            || Ok(HashSet::new()),
+        )
+        .unwrap();
+        assert_eq!(report.failed[0].outcome, "unknown");
+        assert!(file.exists());
     }
 
     #[cfg(target_os = "macos")]

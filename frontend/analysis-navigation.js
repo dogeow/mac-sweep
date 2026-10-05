@@ -39,12 +39,15 @@
     if (!path || path.length < 2) return null;
     const intermediate = path.slice(1, -1).map((parent) => ({ node: parent, report: entry.report, page: 1 }));
     const parents = [...history, ...intermediate];
-    const needsScan = node.hasChildren && !(node.children || []).length;
+    // Entering a directory always refreshes its immediate entries. Prior
+    // children (including a prior empty result) are a snapshot, not evidence
+    // that Finder has left the directory unchanged. The caller browses shallowly.
+    const needsScan = true;
     return {
       path: node.path,
       parents,
       needsScan,
-      history: needsScan ? history : [...parents, { node, report: entry.report, page: 1 }],
+      history,
     };
   }
 

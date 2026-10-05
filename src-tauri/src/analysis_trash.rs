@@ -64,7 +64,12 @@ pub fn move_verified(
     home: &Path,
     device: u64,
     inode: u64,
-    move_to_trash: impl FnOnce(&Path) -> Result<(), String>,
+    move_to_trash: impl FnOnce(
+        &Path,
+        u64,
+        u64,
+    )
+        -> Result<crate::native_trash::Receipt, crate::native_trash::MoveError>,
 ) -> Result<&'static str, String> {
     if !allowed(path, home) {
         return Err("这个位置受保护，只能在 Finder 中查看。".into());
@@ -74,10 +79,11 @@ pub fn move_verified(
         EntryState::Changed => return Ok("changed"),
         EntryState::Ready => {}
     }
-    move_to_trash(path)?;
-    match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok("moved"),
-        _ => Err("移动结果尚未确认，请在 Finder 检查原位置与废纸篓。".into()),
+    let receipt = move_to_trash(path, device, inode).map_err(|error| error.message)?;
+    if receipt.matches(device, inode) {
+        Ok("moved")
+    } else {
+        Err("移动结果尚未确认，请在 Finder 检查原位置与废纸篓。".into())
     }
 }
 
@@ -118,24 +124,46 @@ mod tests {
         fs::write(&path, b"own fixture").unwrap();
         let meta = fs::symlink_metadata(&path).unwrap();
         assert_eq!(
-            move_verified(&path, &home, &home, meta.dev(), meta.ino() + 1, |_| panic!(
-                "replaced identity cannot move"
-            ))
+            move_verified(
+                &path,
+                &home,
+                &home,
+                meta.dev(),
+                meta.ino() + 1,
+                |_, _, _| panic!("replaced identity cannot move")
+            )
             .unwrap(),
             "changed"
         );
         let destination = home.join("moved.bin");
         assert_eq!(
-            move_verified(&path, &home, &home, meta.dev(), meta.ino(), |selected| {
-                fs::rename(selected, &destination).map_err(|e| e.to_string())
-            })
+            move_verified(
+                &path,
+                &home,
+                &home,
+                meta.dev(),
+                meta.ino(),
+                |selected, device, inode| {
+                    fs::rename(selected, &destination).map_err(|e| e.to_string())?;
+                    Ok(crate::native_trash::Receipt {
+                        destination: destination.clone(),
+                        device,
+                        inode,
+                    })
+                }
+            )
             .unwrap(),
             "moved"
         );
         assert_eq!(
-            move_verified(&path, &home, &home, meta.dev(), meta.ino(), |_| panic!(
-                "missing cannot move twice"
-            ))
+            move_verified(
+                &path,
+                &home,
+                &home,
+                meta.dev(),
+                meta.ino(),
+                |_, _, _| panic!("missing cannot move twice")
+            )
             .unwrap(),
             "missing"
         );

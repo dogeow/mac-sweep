@@ -39,7 +39,7 @@
     selection = { analysisId: target.analysisId, nodeId: target.nodeId };
     rowButton = row.querySelector('.analysis-node-name');
     const trash = menu.querySelector('[data-analysis-context-action="trash"]');
-    if (trash) { trash.disabled = target.canTrash !== true; trash.textContent = '移到废纸篓…'; }
+    if (trash) { trash.disabled = target.canTrash !== true; trash.textContent = '移到废纸篓…'; trash.title = trash.disabled ? target.trashReason || '此项目不支持移到废纸篓。' : ''; }
     const finder = menu.querySelector('[data-analysis-context-action="finder"]');
     if (finder) finder.disabled = false;
     menu.setAttribute('role', 'menu');

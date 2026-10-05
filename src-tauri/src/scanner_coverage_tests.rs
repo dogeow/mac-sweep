@@ -56,8 +56,24 @@ impl CoverageFixture {
         directory
     }
 
+    fn app(&self, relative: &str, id: &str, name: &str) -> PathBuf {
+        let path = self.home.join(relative);
+        fs::create_dir_all(path.join("Contents")).unwrap();
+        let mut dictionary = plist::Dictionary::new();
+        dictionary.insert("CFBundleIdentifier".into(), plist::Value::String(id.into()));
+        dictionary.insert(
+            "CFBundleDisplayName".into(),
+            plist::Value::String(name.into()),
+        );
+        plist::Value::Dictionary(dictionary)
+            .to_file_xml(path.join("Contents/Info.plist"))
+            .unwrap();
+        path
+    }
+
     fn snapshot(&self) -> ScanSnapshot {
         ScanSnapshot {
+            cleanup_uncertain: false,
             report: ScanReport {
                 scan_id: "coverage-fixture".into(),
                 started_at: unix_now(),
@@ -91,6 +107,7 @@ fn no_running_or_installed_apps() -> AppInventory {
         apps: vec![],
         complete: true,
         active_paths: HashSet::new(),
+        active_apps: vec![],
         active_complete: true,
     }
 }
@@ -671,4 +688,416 @@ fn cached_tool_runtimes_and_package_downloads_never_become_default_cleanup() {
         .items
         .iter()
         .all(|item| item.risk == "review" && !item.selected_by_default));
+}
+
+#[test]
+fn exact_ownership_beats_vendor_siblings_and_ambiguous_data_stays_manual() {
+    let fixture = CoverageFixture::new();
+    let mut apps = no_running_or_installed_apps();
+    for (id, name) in [
+        ("com.fixture.sibling", "Sibling"),
+        ("com.fixture.owner", "Exact Owner"),
+    ] {
+        apps.apps.push(InstalledApp {
+            id: id.into(),
+            name: name.into(),
+            path: fixture.home.join(format!("Applications/{name}.app")),
+        });
+    }
+    assert_eq!(
+        apps.related("COM.FIXTURE.OWNER").unwrap().name,
+        "Exact Owner"
+    );
+    assert_eq!(
+        apps.related("com.fixture.owner.helper").unwrap().name,
+        "Exact Owner"
+    );
+    assert!(apps.related("com.fixture.unidentified").is_none());
+    assert!(apps.has_possible_owner("com.fixture.unidentified"));
+    assert!(apps.owner_uncertain("com.fixture.unidentified"));
+
+    let root = fixture.home.join("Library/Caches");
+    let cancel = AtomicBool::new(false);
+    let mut ctx = coverage_context(&cancel);
+    let mut snapshot = fixture.snapshot();
+    for owner in ["com.fixture.owner", "com.fixture.unidentified"] {
+        let branch = fixture.old_branch(&format!("Library/Caches/{owner}"), 2);
+        add_candidate(
+            &mut snapshot,
+            &mut ctx,
+            &apps,
+            &branch,
+            &root,
+            Rule::Cache,
+            None,
+            owner,
+            None,
+        );
+    }
+    let exact = snapshot
+        .report
+        .items
+        .iter()
+        .find(|item| item.name == "com.fixture.owner")
+        .unwrap();
+    assert_eq!(exact.app_name.as_deref(), Some("Exact Owner"));
+    assert_eq!(exact.bundle_id.as_deref(), Some("com.fixture.owner"));
+    assert!(exact.selected_by_default);
+    let ambiguous = snapshot
+        .report
+        .items
+        .iter()
+        .find(|item| item.name == "com.fixture.unidentified")
+        .unwrap();
+    assert_eq!(ambiguous.category, "cache");
+    assert_eq!(ambiguous.risk, "review");
+    assert!(!ambiguous.selected_by_default);
+    assert!(ambiguous.app_name.is_none());
+    assert!(ambiguous.bundle_id.is_none());
+
+    apps.apps.push(InstalledApp {
+        id: "com.fixture.owner.helper.child".into(),
+        name: "Another Helper".into(),
+        path: fixture.home.join("Applications/Another Helper.app"),
+    });
+    assert!(apps.related("com.fixture.owner.helper").is_none());
+    assert!(apps.owner_uncertain("com.fixture.owner.helper"));
+    // An exact bundle always remains decisive even when hierarchical matches exist.
+    assert_eq!(
+        apps.related("com.fixture.owner").unwrap().name,
+        "Exact Owner"
+    );
+}
+
+#[test]
+fn active_bundle_ids_outside_inventory_roots_and_through_links_preserve_data() {
+    for through_link in [false, true] {
+        let fixture = CoverageFixture::new();
+        let app = fixture.app(
+            "portable/Readable Tool.app",
+            "com.fixture.running",
+            "Readable Tool",
+        );
+        let active_path = if through_link {
+            let alias = fixture.home.join("Applications/Unrelated Alias.app");
+            fs::create_dir_all(alias.parent().unwrap()).unwrap();
+            symlink(&app, &alias).unwrap();
+            alias
+        } else {
+            app
+        };
+        let owner = "com.fixture.running.helper";
+        let branch = fixture.old_branch(&format!("Library/Caches/{owner}"), 2);
+        let root = fixture.home.join("Library/Caches");
+        let cancel = AtomicBool::new(false);
+        let mut ctx = coverage_context(&cancel);
+        let mut snapshot = fixture.snapshot();
+        let mut apps = no_running_or_installed_apps();
+        add_candidate(
+            &mut snapshot,
+            &mut ctx,
+            &apps,
+            &branch,
+            &root,
+            Rule::Cache,
+            None,
+            owner,
+            None,
+        );
+        let display = &snapshot.report.items[0];
+        let candidate = snapshot.validated.get(&display.id).unwrap();
+        assert!(validate_item(&snapshot, candidate, &apps).is_ok());
+
+        apps.refresh_active_paths(HashSet::from([active_path]))
+            .unwrap();
+        assert!(
+            apps.apps.is_empty(),
+            "active identity is independent of installed roots"
+        );
+        assert!(apps.active_related(owner));
+        assert!(apps.active_related("Readable Tool"));
+        assert!(!apps.active_related("com.fixture.sibling"));
+        assert!(apps.has_possible_owner("com.fixture.sibling"));
+        assert!(validate_item(&snapshot, candidate, &apps).is_err());
+        let mut active_snapshot = fixture.snapshot();
+        add_candidate(
+            &mut active_snapshot,
+            &mut ctx,
+            &apps,
+            &branch,
+            &root,
+            Rule::Cache,
+            None,
+            owner,
+            None,
+        );
+        assert!(active_snapshot.report.items.is_empty());
+        assert!(branch.is_dir());
+
+        apps.refresh_active_paths(HashSet::new()).unwrap();
+        assert!(apps.active_complete);
+        assert!(!apps.active_related(owner));
+        assert!(validate_item(&snapshot, candidate, &apps).is_ok());
+    }
+}
+
+#[test]
+fn unreadable_active_metadata_disables_defaults_and_cleanup_validation() {
+    let fixture = CoverageFixture::new();
+    let app = fixture.app(
+        "portable/Readable Tool.app",
+        "com.fixture.running",
+        "Readable Tool",
+    );
+    let mut apps = no_running_or_installed_apps();
+    apps.refresh_active_paths(HashSet::from([app.clone()]))
+        .unwrap();
+    fs::write(app.join("Contents/Info.plist"), b"invalid metadata").unwrap();
+    assert!(apps.refresh_active_paths(HashSet::from([app])).is_err());
+    assert!(!apps.active_complete);
+    assert!(apps.active_apps.is_empty());
+
+    let branch = fixture.old_branch("Library/Caches/unrelated", 2);
+    let root = fixture.home.join("Library/Caches");
+    let cancel = AtomicBool::new(false);
+    let mut ctx = coverage_context(&cancel);
+    let mut snapshot = fixture.snapshot();
+    add_candidate(
+        &mut snapshot,
+        &mut ctx,
+        &apps,
+        &branch,
+        &root,
+        Rule::Cache,
+        None,
+        "unrelated",
+        None,
+    );
+    assert_eq!(snapshot.report.items.len(), 1);
+    let display = &snapshot.report.items[0];
+    assert!(!display.selected_by_default);
+    assert_eq!(display.risk, "review");
+    let candidate = snapshot.validated.get(&display.id).unwrap();
+    assert!(validate_item(&snapshot, candidate, &apps).is_err());
+    assert!(branch.is_dir());
+}
+
+#[test]
+fn orphan_metadata_never_relaxes_browser_or_database_protection() {
+    for name in [
+        "cookies.sqlite",
+        "places.sqlite",
+        "History.db",
+        "LoginData.sqlite",
+        "state.sqlite3",
+        "STATE.SQLITE",
+    ] {
+        let fixture = CoverageFixture::new();
+        let owner = "com.fixture.removed";
+        let database = fixture.file(&format!("Library/Application Support/{owner}/{name}"));
+        fixture.old(&database);
+        let directory = database.parent().unwrap();
+        fixture.old(directory);
+        assert!(matches!(
+            inventory(directory, None, true, &mut |_, _| Ok(())),
+            Err(WalkError::Protected)
+        ));
+        let root = fixture.home.join("Library/Application Support");
+        let cancel = AtomicBool::new(false);
+        let mut ctx = coverage_context(&cancel);
+        let mut snapshot = fixture.snapshot();
+        add_candidate(
+            &mut snapshot,
+            &mut ctx,
+            &no_running_or_installed_apps(),
+            directory,
+            &root,
+            Rule::OrphanMetadata,
+            Some(owner.into()),
+            owner,
+            None,
+        );
+        assert!(snapshot.report.items.is_empty(), "offered protected {name}");
+        assert!(snapshot.validated.is_empty());
+        assert!(database.is_file());
+    }
+}
+
+#[test]
+fn candidates_remain_disjoint_across_categories_and_exact_registered_roots() {
+    for parent_first in [false, true] {
+        let fixture = CoverageFixture::new();
+        let owner = "com.fixture.removed";
+        let child = fixture.old_branch(
+            "Library/Application Support/com.fixture.removed/Cache/old-branch",
+            2,
+        );
+        let cache_root = child.parent().unwrap().to_path_buf();
+        let parent = cache_root.parent().unwrap().to_path_buf();
+        let preserved =
+            fixture.file("Library/Application Support/com.fixture.removed/settings.plist");
+        for path in [&cache_root, &parent, &preserved] {
+            fixture.old(path);
+        }
+        let support_root = fixture.home.join("Library/Application Support");
+        let cancel = AtomicBool::new(false);
+        let mut ctx = coverage_context(&cancel);
+        let mut snapshot = fixture.snapshot();
+        let apps = no_running_or_installed_apps();
+        let candidates = [
+            (
+                &parent,
+                &support_root,
+                Rule::OrphanMetadata,
+                Some(owner.to_string()),
+            ),
+            (&child, &cache_root, Rule::RebuildableCache, None),
+        ];
+        let order = if parent_first { [0, 1] } else { [1, 0] };
+        for index in order {
+            let (path, root, rule, orphan) = &candidates[index];
+            add_candidate(
+                &mut snapshot,
+                &mut ctx,
+                &apps,
+                path,
+                root,
+                *rule,
+                orphan.clone(),
+                owner,
+                None,
+            );
+        }
+        assert_eq!(snapshot.report.items.len(), 1);
+        assert_eq!(snapshot.validated.len(), 1);
+        assert_eq!(ctx.found, 1);
+        let display = &snapshot.report.items[0];
+        assert_eq!(ctx.bytes, display.bytes);
+        let registered = snapshot.validated.get(&display.id).unwrap();
+        assert_eq!(
+            registered.path,
+            if parent_first {
+                parent.clone()
+            } else {
+                child.clone()
+            }
+        );
+        assert_eq!(
+            registered.root,
+            if parent_first {
+                support_root
+            } else {
+                cache_root
+            }
+        );
+        assert!(validate_item(&snapshot, registered, &apps).is_ok());
+        assert!(preserved.is_file());
+    }
+}
+
+#[test]
+fn authoritative_executable_paths_recognize_app_extension_case_and_preserve_newlines() {
+    for (executable, expected) in [
+        (
+            "/Applications/Portable.APP/Contents/MacOS/Portable",
+            "/Applications/Portable.APP",
+        ),
+        (
+            "/tmp/Portable\nTool.App/Contents/MacOS/Tool",
+            "/tmp/Portable\nTool.App",
+        ),
+        (
+            "/Applications/Outer.aPp/Contents/Helpers/Inner.app/Contents/MacOS/Inner",
+            "/Applications/Outer.aPp",
+        ),
+    ] {
+        assert_eq!(
+            app_bundle_from_executable(Path::new(executable)).unwrap(),
+            Some(PathBuf::from(expected))
+        );
+        assert!(is_app_bundle(Path::new(expected)));
+    }
+    assert_eq!(normalized_name("Portable.APP"), normalized_name("Portable"));
+    assert_eq!(app_name_without_extension("工具.App"), "工具");
+    for executable in ["/usr/bin/python3", "/tmp/tool.app-cache/runner"] {
+        assert!(app_bundle_from_executable(Path::new(executable))
+            .unwrap()
+            .is_none());
+    }
+    for malformed in [
+        "Portable.APP/Contents/MacOS/Tool",
+        "/Applications/Portable.APP",
+    ] {
+        assert!(app_bundle_from_executable(Path::new(malformed)).is_err());
+    }
+}
+
+#[test]
+fn unreadable_live_process_never_returns_a_partial_active_inventory() {
+    let paths = bundle_paths_from_processes([1, 2], |pid| {
+        if pid == 1 {
+            Ok(Some(PathBuf::from("/tmp/Portable.APP/Contents/MacOS/Tool")))
+        } else {
+            Err("kernel process-path permission denied".into())
+        }
+    });
+    assert!(paths.is_err());
+    let paths = bundle_paths_from_processes([1, 2], |pid| {
+        Ok((pid == 1).then(|| PathBuf::from("/tmp/Portable.APP/Contents/MacOS/Tool")))
+    })
+    .unwrap();
+    assert_eq!(paths, HashSet::from([PathBuf::from("/tmp/Portable.APP")]));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_process_paths_ignore_spoofed_argv_zero_and_track_the_actual_app_bundle() {
+    use std::os::unix::process::CommandExt;
+    struct TestProcess(std::process::Child);
+    impl Drop for TestProcess {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let fixture = CoverageFixture::new();
+    let app = fixture.app(
+        "Portable\nTool.APP",
+        "com.fixture.portable",
+        "Portable Tool",
+    );
+    let executable = app.join("Contents/MacOS/sleep");
+    fs::create_dir_all(executable.parent().unwrap()).unwrap();
+    fs::copy("/bin/sleep", &executable).unwrap();
+    let app_process = TestProcess(
+        std::process::Command::new(&executable)
+            .arg0("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap(),
+    );
+    let actual = native_process_executable(app_process.0.id() as i32)
+        .unwrap()
+        .unwrap();
+    assert_eq!(actual, executable);
+    assert_eq!(
+        app_bundle_from_executable(&actual).unwrap(),
+        Some(app.clone())
+    );
+    let mut apps = no_running_or_installed_apps();
+    apps.refresh_active_paths(HashSet::from([app])).unwrap();
+    assert!(apps.active_related("com.fixture.portable"));
+
+    let ordinary_process = TestProcess(
+        std::process::Command::new("/bin/sleep")
+            .arg0("/Applications/Invented.app/Contents/MacOS/Invented")
+            .arg("30")
+            .spawn()
+            .unwrap(),
+    );
+    let actual = native_process_executable(ordinary_process.0.id() as i32)
+        .unwrap()
+        .unwrap();
+    assert_eq!(actual, Path::new("/bin/sleep"));
+    assert!(app_bundle_from_executable(&actual).unwrap().is_none());
 }

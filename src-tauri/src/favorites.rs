@@ -224,10 +224,7 @@ pub fn add_recorded(
     device: u64,
     inode: u64,
 ) -> Result<FavoritesList, String> {
-    let _guard = STORE_LOCK
-        .lock()
-        .map_err(|_| "收藏记录暂时不可用，请重启应用后重试。")?;
-    let mut store = load(data_dir)?;
+    // Resolve potentially slow user paths before locking the small configuration store.
     match analysis_entry::check(path, source_root, device, inode)? {
         EntryState::Ready => {}
         EntryState::Missing => return Err(MISSING.into()),
@@ -248,6 +245,10 @@ pub fn add_recorded(
         .to_str()
         .ok_or("这个目录名称无法保存为收藏。")?
         .to_owned();
+    let _guard = STORE_LOCK
+        .lock()
+        .map_err(|_| "收藏记录暂时不可用，请重启应用后重试。")?;
+    let mut store = load(data_dir)?;
     if store
         .favorites
         .iter()
@@ -286,15 +287,16 @@ pub fn remove(data_dir: &Path, favorite_id: &str) -> Result<FavoritesList, Strin
 }
 
 pub fn resolve(data_dir: &Path, favorite_id: &str) -> Result<FavoriteDirectory, String> {
-    let _guard = STORE_LOCK
-        .lock()
-        .map_err(|_| "收藏记录暂时不可用，请重启应用后重试。")?;
-    let store = load(data_dir)?;
-    let favorite = store
-        .favorites
-        .into_iter()
-        .find(|favorite| favorite.id == favorite_id)
-        .ok_or("这个收藏已不在列表中，请刷新收藏列表。")?;
+    let favorite = {
+        let _guard = STORE_LOCK
+            .lock()
+            .map_err(|_| "收藏记录暂时不可用，请重启应用后重试。")?;
+        load(data_dir)?
+            .favorites
+            .into_iter()
+            .find(|favorite| favorite.id == favorite_id)
+            .ok_or("这个收藏已不在列表中，请刷新收藏列表。")?
+    };
     let path = Path::new(&favorite.path);
     let metadata = fs::symlink_metadata(path).map_err(directory_error)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {

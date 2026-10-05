@@ -37,7 +37,7 @@
   const PAGE_SIZE = 100;
   const GROUP_PAGE_SIZE = 30;
   const cleanupModel = window.MacSweepCleanup;
-  const state = { view: 'home', analysisBusy: false, report: null, diskOverview: null, diskUnavailable: false, selected: new Set(), moved: new Set(), failures: new Map(), receipts: [], cleanOutcome: null, groups: new Map(), expanded: new Set(), expandedTree: new Set(), expandedFileInfo: new Set(), treePages: new Map(), treeNodes: new Map(), filter: 'all', search: '', risk: 'all', sort: 'size-desc', page: 1, scanning: false, cancelling: false, cleaning: false, scanRevision: 0, dialogSelection: null, previousFocus: null, message: null, extraWarnings: [] };
+  const state = { view: 'home', analysisBusy: false, report: null, diskOverview: null, diskUnavailable: false, selected: new Set(), moved: new Set(), failures: new Map(), unknownMoves: new Set(), receipts: [], cleanOutcome: null, blockedUntilRescan: false, groups: new Map(), expanded: new Set(), expandedTree: new Set(), expandedFileInfo: new Set(), treePages: new Map(), treeNodes: new Map(), filter: 'all', search: '', risk: 'all', sort: 'size-desc', page: 1, scanning: false, cancelling: false, cleaning: false, scanRevision: 0, dialogSelection: null, previousFocus: null, message: null, extraWarnings: [] };
   const bytes = (value) => {
     const number = Number(value) || 0;
     if (number === 0) return '0 B';
@@ -184,8 +184,9 @@
   }
   function renderCandidate(item, busy, depth) {
     const failure = state.failures.get(item.id);
+    const uncertain = state.unknownMoves.has(item.id);
     const infoOpen = state.expandedFileInfo.has(item.id);
-    return `<div class="tree-file${failure ? ' failed' : ''}" data-tree-depth="${Math.min(depth, 5)}"><div class="tree-file-row"><input type="checkbox" data-item-id="${escape(item.id)}" ${state.selected.has(item.id) ? 'checked' : ''} ${busy ? 'disabled' : ''} aria-label="选择 ${escape(item.name)}" /><span class="tree-file-icon">${icon(item.isDirectory ? 'folder' : 'file')}</span><strong class="tree-file-name" title="${escape(item.name)}">${escape(item.name)}</strong>${failure ? '<span class="tree-failure-count">未能移动</span>' : ''}<span class="tree-file-size">${bytes(item.bytes)}</span><button class="tree-file-info-button" data-file-info="${escape(item.id)}" aria-expanded="${infoOpen}" aria-label="${infoOpen ? '收起' : '查看'} ${escape(item.name)} 的${failure ? '失败原因与' : ''}文件信息" title="${failure ? '查看失败原因与文件信息' : '查看文件信息'}" ${busy ? 'disabled' : ''}>${icon('info')}</button><button class="row-reveal" data-reveal-id="${escape(item.id)}" title="在 Finder 中显示此项目" aria-label="在 Finder 中显示 ${escape(item.name)}" ${!desktop || demo || busy ? 'disabled' : ''}>${icon('folder')}</button></div>${infoOpen ? `<div class="tree-file-info">${failure ? `<p class="tree-file-error">未能移动：${escape(failure)}</p>` : ''}<p>${escape(item.reason)}</p><code>${escape(item.path)}</code><p class="tree-file-meta">修改于 ${date(item.modifiedAt)} · ${Number(item.files || 0).toLocaleString()} 个文件</p></div>` : ''}</div>`;
+    return `<div class="tree-file${failure ? ' failed' : ''}" data-tree-depth="${Math.min(depth, 5)}"><div class="tree-file-row"><input type="checkbox" data-item-id="${escape(item.id)}" ${state.selected.has(item.id) ? 'checked' : ''} ${busy ? 'disabled' : ''} aria-label="选择 ${escape(item.name)}" /><span class="tree-file-icon">${icon(item.isDirectory ? 'folder' : 'file')}</span><strong class="tree-file-name" title="${escape(item.name)}">${escape(item.name)}</strong>${failure ? `<span class="tree-failure-count">${uncertain ? '结果未确认' : '未能移动'}</span>` : ''}<span class="tree-file-size">${bytes(item.bytes)}</span><button class="tree-file-info-button" data-file-info="${escape(item.id)}" aria-expanded="${infoOpen}" aria-label="${infoOpen ? '收起' : '查看'} ${escape(item.name)} 的${failure ? '失败原因与' : ''}文件信息" title="${failure ? '查看失败原因与文件信息' : '查看文件信息'}" ${busy ? 'disabled' : ''}>${icon('info')}</button><button class="row-reveal" data-reveal-id="${escape(item.id)}" title="在 Finder 中显示此项目" aria-label="在 Finder 中显示 ${escape(item.name)}" ${!desktop || demo || busy ? 'disabled' : ''}>${icon('folder')}</button></div>${infoOpen ? `<div class="tree-file-info">${failure ? `<p class="tree-file-error">${uncertain ? '' : '未能移动：'}${escape(failure)}</p>` : ''}<p>${escape(item.reason)}</p><code>${escape(item.path)}</code><p class="tree-file-meta">修改于 ${date(item.modifiedAt)} · ${Number(item.files || 0).toLocaleString()} 个文件</p></div>` : ''}</div>`;
   }
   function renderTreeFiles(node, key, busy, depth) {
     if (!node.files.length) return '';
@@ -200,7 +201,8 @@
     const selected = cleanupModel.selectedState(node, state.selected);
     const open = state.expandedTree.has(key);
     const failedCount = node.items.filter((item) => state.failures.has(item.id)).length;
-    return `<div class="tree-directory" data-tree-depth="${Math.min(depth, 5)}"><div class="tree-directory-row${selected.count ? ' selected' : ''}"><input type="checkbox" data-tree-id="${escape(key)}" ${selected.checked ? 'checked' : ''} ${busy ? 'disabled' : ''} aria-label="选择 ${escape(node.name)} 下本次找到的全部 ${node.items.length} 项内容" /><button class="tree-directory-toggle" data-tree-toggle="${escape(key)}" aria-expanded="${open}" title="${escape(node.path)}" aria-label="${open ? '收起' : '查看'} ${escape(node.name)} 下的待检查内容" ${busy ? 'disabled' : ''}><span class="tree-directory-icon">${icon('folder')}</span><span class="tree-directory-name"><strong>${escape(node.name)}</strong><small>${node.items.length.toLocaleString()} 项待检查${failedCount ? ` · <span class="tree-failure-count">${failedCount} 项未能移动</span>` : ''}</small></span><span class="tree-directory-size">${bytes(node.bytes)}</span><span class="tree-directory-chevron">${icon('chevron-down')}</span></button></div>${open ? node.children.map((child) => renderTreeDirectory(child, group, busy, depth + 1)).join('') + renderTreeFiles(node, key, busy, depth + 1) : ''}</div>`;
+    const uncertainCount = node.items.filter((item) => state.unknownMoves.has(item.id)).length;
+    return `<div class="tree-directory" data-tree-depth="${Math.min(depth, 5)}"><div class="tree-directory-row${selected.count ? ' selected' : ''}"><input type="checkbox" data-tree-id="${escape(key)}" ${selected.checked ? 'checked' : ''} ${busy ? 'disabled' : ''} aria-label="选择 ${escape(node.name)} 下本次找到的全部 ${node.items.length} 项内容" /><button class="tree-directory-toggle" data-tree-toggle="${escape(key)}" aria-expanded="${open}" title="${escape(node.path)}" aria-label="${open ? '收起' : '查看'} ${escape(node.name)} 下的待检查内容" ${busy ? 'disabled' : ''}><span class="tree-directory-icon">${icon('folder')}</span><span class="tree-directory-name"><strong>${escape(node.name)}</strong><small>${node.items.length.toLocaleString()} 项待检查${failedCount ? ` · <span class="tree-failure-count">${uncertainCount ? `${uncertainCount} 项结果未确认` : `${failedCount} 项未能移动`}</span>` : ''}</small></span><span class="tree-directory-size">${bytes(node.bytes)}</span><span class="tree-directory-chevron">${icon('chevron-down')}</span></button></div>${open ? node.children.map((child) => renderTreeDirectory(child, group, busy, depth + 1)).join('') + renderTreeFiles(node, key, busy, depth + 1) : ''}</div>`;
   }
   function renderGroups(groups, busy, filtered) {
     state.treeNodes.clear();
@@ -211,7 +213,7 @@
       const count = `${filtered ? '当前筛选 · ' : ''}${group.items.length.toLocaleString()} ${group.fileCount > group.items.length ? `处 · ${group.fileCount.toLocaleString()} 个文件` : '项'}`;
       const tree = open ? cleanupModel.buildDirectoryTree(group.items, state.sort) : [];
       const directories = open ? `<div class="group-tree"><p class="group-tree-note">${escape(explanations[group.category] || '')} 仅处理本次列出的候选；整目录候选会包含其中全部子项。</p>${tree.map((node) => renderTreeDirectory(node, group, busy)).join('')}</div>` : '';
-      return `<article class="cleanup-group${selected.count ? ' selected' : ''}${failures.length ? ' failed' : ''}"><div class="group-row"><input type="checkbox" data-group-id="${escape(group.key)}" ${selected.checked ? 'checked' : ''} ${busy || (!group.suggested && !open) ? 'disabled' : ''} aria-label="选择 ${escape(group.name)} 的全部 ${group.items.length} 个匹配项目" /><span class="group-icon ${escape(group.category)}">${icon(categoryIcons[group.category])}</span><div class="group-name"><strong>${escape(group.name)}</strong><span>${escape(labels[group.category] || group.category)} · ${count}</span></div>${!group.suggested ? '<span class="group-badge review">需确认</span>' : ''}<strong class="group-size">${bytes(group.bytes)}</strong></div>${failures.length ? `<p class="group-error">${failures.length} 项未能移动，展开查看原因</p>` : ''}<details class="group-details" data-group-details="${escape(group.key)}" ${open ? 'open' : ''}><summary title="${open ? '收起' : '查看'} ${escape(group.name)} 的目录" aria-label="${open ? '收起' : '查看'} ${escape(group.name)} 的目录" aria-disabled="${busy}"><span class="sr-only">查看目录</span><span class="group-chevron">${icon('chevron-down')}</span></summary>${directories}</details></article>`;
+      return `<article class="cleanup-group${selected.count ? ' selected' : ''}${failures.length ? ' failed' : ''}"><div class="group-row"><input type="checkbox" data-group-id="${escape(group.key)}" ${selected.checked ? 'checked' : ''} ${busy || (!group.suggested && !open) ? 'disabled' : ''} aria-label="选择 ${escape(group.name)} 的全部 ${group.items.length} 个匹配项目" /><span class="group-icon ${escape(group.category)}">${icon(categoryIcons[group.category])}</span><div class="group-name"><strong>${escape(group.name)}</strong><span>${escape(labels[group.category] || group.category)} · ${count}</span></div>${!group.suggested ? '<span class="group-badge review">需确认</span>' : ''}<strong class="group-size">${bytes(group.bytes)}</strong></div>${failures.length ? `<p class="group-error">${failures.some(item => state.unknownMoves.has(item.id)) ? '部分移动结果未确认，检查 Finder 后重新检查' : `${failures.length} 项未能移动，展开查看原因`}</p>` : ''}<details class="group-details" data-group-details="${escape(group.key)}" ${open ? 'open' : ''}><summary title="${open ? '收起' : '查看'} ${escape(group.name)} 的目录" aria-label="${open ? '收起' : '查看'} ${escape(group.name)} 的目录" aria-disabled="${busy}"><span class="sr-only">查看目录</span><span class="group-chevron">${icon('chevron-down')}</span></summary>${directories}</details></article>`;
     }).join('');
     $('result-rows').querySelectorAll('[data-tree-depth]').forEach((element) => {
       element.style.setProperty('--tree-depth', Number(element.dataset.treeDepth));
@@ -287,12 +289,12 @@
     all.indeterminate = !all.checked && pageSuggested.some((item) => state.selected.has(item.id));
     all.disabled = busy || pageSuggested.length === 0;
     all.setAttribute('aria-label', `选择当前列表中的 ${pageSuggested.length} 个建议项`);
-    $('select-safe').disabled = busy || !items.some((item) => item.selectedByDefault === true);
+    $('select-safe').disabled = busy || !visible.some((item) => item.selectedByDefault === true);
     $('clear-selection').disabled = busy || selected.length === 0;
     $('selection-count').textContent = selected.length ? `已选 ${bytes(sum(selected))}` : '请选择要清理的内容';
     const reviewCount = selected.filter((item) => item.risk !== 'low').length;
-    $('selection-description').textContent = selected.length ? (reviewCount ? `包含 ${reviewCount} 项需要你确认的内容` : '移到废纸篓前，会再次让你确认。') : '移到废纸篓前，会再次让你确认。';
-    $('review-cleanup').disabled = busy || selected.length === 0 || !desktop || demo;
+    $('selection-description').textContent = state.blockedUntilRescan ? '上次移动结果未确认，请完成重新检查后再清理。' : selected.length ? (reviewCount ? `包含 ${reviewCount} 项需要你确认的内容` : '移到废纸篓前，会再次让你确认。') : '移到废纸篓前，会再次让你确认。';
+    $('review-cleanup').disabled = busy || selected.length === 0 || !desktop || demo || state.blockedUntilRescan;
     $('review-cleanup').title = demo ? '演示模式禁止清理' : !desktop ? '请在桌面应用中使用' : '';
     if (state.view !== 'analysis') {
       $('start-scan').disabled = busy || !desktop || demo;
@@ -324,9 +326,11 @@
   function applyReport(report) {
     if (!report || !Array.isArray(report.items) || typeof report.scanId !== 'string') throw new Error('扫描结果格式无效，已保留之前的结果。');
     state.report = report;
+    if (!report.cancelled) state.blockedUntilRescan = false;
     state.selected = new Set(report.items.filter((item) => item.selectedByDefault === true).map((item) => item.id));
     state.moved.clear();
     state.failures.clear();
+    state.unknownMoves.clear();
     state.expanded.clear();
     state.expandedTree.clear();
     state.expandedFileInfo.clear();
@@ -373,12 +377,15 @@
   }
   function openReview() {
     const selected = selectedItems();
-    if (!desktop || demo || state.scanning || state.cleaning || !selected.length) return;
+    if (!desktop || demo || state.scanning || state.cleaning || state.analysisBusy || !selected.length) return;
+    if (state.blockedUntilRescan) { setMessage('error', '上次清理结果未确认', '请先在 Finder 检查文件状态，再重新检查后清理。'); return; }
     state.dialogSelection = { scanId: state.report.scanId, itemIds: selected.map((item) => item.id) };
     state.cleanOutcome = null;
     renderCleanOutcome();
     state.previousFocus = document.activeElement;
-    $('dialog-count').textContent = `${selected.length} 个项目`;
+    const visibleIds = new Set(visibleItems().map((item) => item.id));
+    const hiddenSelected = selected.filter((item) => !visibleIds.has(item.id)).length;
+    $('dialog-count').textContent = `${selected.length} 个项目${hiddenSelected ? ` · 其中 ${hiddenSelected} 项不在当前筛选结果中` : ''}`;
     $('dialog-bytes').textContent = bytes(sum(selected));
     $('dialog-categories').innerHTML = categories.map((category) => {
       const group = selected.filter((item) => item.category === category);
@@ -392,13 +399,23 @@
     $('dialog-cancel').disabled = false;
     $('dialog-confirm').disabled = false;
     $('dialog-confirm').innerHTML = `${icon('trash')}移到废纸篓`;
-    $('cleanup-dialog').showModal();
-    $('dialog-cancel').focus();
+    try {
+      const dialog = $('cleanup-dialog');
+      const opened = window.macSweepDialogs ? window.macSweepDialogs.open(dialog, { initialFocus: $('dialog-cancel'), returnFocus: state.previousFocus }) : (typeof dialog.showModal === 'function' && (dialog.showModal(), true));
+      if (!opened) throw new Error('确认窗口无法显示。');
+      $('dialog-cancel').focus();
+    } catch (_error) {
+      state.dialogSelection = null;
+      setMessage('error', '确认窗口暂时无法打开', '没有移动任何内容，请稍后重试。');
+      render();
+    }
   }
   function closeReview() {
     if (state.cleaning) return;
-    $('cleanup-dialog').close();
+    if (window.macSweepDialogs) window.macSweepDialogs.close($('cleanup-dialog'));
+    else if (typeof $('cleanup-dialog').close === 'function') $('cleanup-dialog').close();
     state.dialogSelection = null;
+    render();
     if (state.previousFocus?.isConnected) state.previousFocus.focus();
   }
   function validCleanupReport(report, request) {
@@ -409,12 +426,14 @@
       if (!item || typeof item.id !== 'string' || !requested.has(item.id) || seen.has(item.id) || typeof item.path !== 'string' || !item.path || !Number.isFinite(item.bytes) || item.bytes < 0) return false;
       seen.add(item.id);
     }
+    if (report.moved.some((item) => item.outcome !== 'moved') || report.failed.some((item) => !['failed', 'unknown'].includes(item.outcome))) return false;
     return seen.size === requested.size && (report.moved.length > 0 || report.bytesMoved === 0);
   }
   async function cleanup() {
     const request = state.dialogSelection;
-    if (!desktop || demo || !request || state.cleaning || state.scanning || request.scanId !== state.report?.scanId) return;
+    if (!desktop || demo || !request || state.blockedUntilRescan || state.cleaning || state.scanning || request.scanId !== state.report?.scanId) return;
     state.cleaning = true;
+    let confirmed = false;
     state.cleanOutcome = null;
     $('dialog-cancel').disabled = true;
     $('dialog-confirm').disabled = true;
@@ -426,22 +445,40 @@
     try {
       const report = await invoke('clean_items', request);
       if (!validCleanupReport(report, request)) throw new Error('清理回执不完整或格式无效。请在 Finder 检查文件位置后重新扫描。');
+      confirmed = true;
       const movedAt = new Date().toLocaleString('zh-CN', { hour12: false });
       const sourceById = new Map((state.report?.items || []).map((item) => [item.id, item]));
       report.moved.forEach((item) => { state.receipts.unshift({ path: item.path, name: sourceById.get(item.id)?.name || String(item.path).split('/').pop(), bytes: item.bytes, movedAt }); });
-      report.moved.forEach((item) => { state.moved.add(item.id); state.selected.delete(item.id); state.failures.delete(item.id); });
-      report.failed.forEach((item) => { state.failures.set(item.id, item.error || '移动失败'); });
-      const failed = report.failed.length;
+      report.moved.forEach((item) => { state.moved.add(item.id); state.selected.delete(item.id); state.failures.delete(item.id); state.unknownMoves.delete(item.id); });
+      report.failed.forEach((item) => {
+        if (item.outcome === 'unknown') { state.unknownMoves.add(item.id); state.failures.set(item.id, '移动结果未确认，检查 Finder 后重新检查。'); }
+        else { state.unknownMoves.delete(item.id); state.failures.set(item.id, item.error || '移动失败'); }
+      });
+      const unknown = report.failed.filter((item) => item.outcome === 'unknown').length;
+      const failed = report.failed.length - unknown;
       const moved = report.moved.length;
       state.cleanOutcome = {
-        type: failed ? 'info' : 'success', movedCount: moved, bytesMoved: report.bytesMoved, failedCount: failed, unknown: false,
-        summary: `${moved ? `已移到废纸篓 ${moved} 项 · ${bytes(report.bytesMoved)}` : ''}${failed ? `${moved ? ' · ' : ''}${failed} 项未完成，选择已保留` : ''}`,
-        detail: failed ? '未完成的项目仍保留选择，展开对应文件可查看原因。确认废纸篓中的文件不再需要后，再自行清空。' : '文件可在 Finder 废纸篓中找回。确认不再需要后，再自行清空；移入废纸篓不会立即释放空间。',
+        type: unknown ? 'error' : failed ? 'info' : 'success', movedCount: moved, bytesMoved: report.bytesMoved, failedCount: failed, unknownCount: unknown, unknown: unknown > 0,
+        summary: [moved ? `已移到废纸篓 ${moved} 项 · ${bytes(report.bytesMoved)}` : '', failed ? `${failed} 项未完成，选择已保留` : '', unknown ? `${unknown} 项移动结果未确认，检查 Finder 后重新检查` : ''].filter(Boolean).join(' · '),
+        detail: unknown ? '未确认项目仍保留选择，此次不会重试。先检查 Finder 中的原文件与废纸篓，再重新检查。' : failed ? '未完成的项目仍保留选择，展开对应文件可查看原因。确认废纸篓中的文件不再需要后，再自行清空。' : '文件可在 Finder 废纸篓中找回。确认不再需要后，再自行清空；移入废纸篓不会立即释放空间。',
       };
+      if (unknown) { confirmed = false; state.blockedUntilRescan = true; }
     } catch (error) {
+      state.blockedUntilRescan = true;
       state.cleanOutcome = { type: 'error', unknown: true, summary: '清理结果未确认，请检查文件状态', detail: `${errorText(error)} 请检查 Finder 中的原文件与废纸篓，必要时重新扫描。` };
     }
-    finally { state.cleaning = false; closeReview(); render(); refreshDisk(); }
+    finally {
+      state.cleaning = false;
+      if (confirmed) closeReview();
+      else {
+        state.dialogSelection = null;
+        $('dialog-confirm').disabled = true;
+        $('dialog-cancel').disabled = false;
+        $('cleanup-progress-text').textContent = '结果未确认，请先在 Finder 检查文件状态，再重新检查；此次不会重试。';
+      }
+      render();
+      refreshDisk();
+    }
   }
   async function openTrash() {
     if (!desktop || demo) return;
@@ -594,7 +631,7 @@
       if (button && !button.disabled) revealItem(button.dataset.revealId);
     });
     $('select-all').addEventListener('change', (event) => { if (state.scanning || state.cleaning || state.analysisBusy) return; currentPageItems().filter((item) => item.selectedByDefault === true).forEach((item) => { if (event.target.checked) state.selected.add(item.id); else state.selected.delete(item.id); }); render(); });
-    $('select-safe').addEventListener('click', () => { if (state.scanning || state.cleaning || state.analysisBusy) return; activeItems().filter((item) => item.selectedByDefault === true).forEach((item) => state.selected.add(item.id)); render(); });
+    $('select-safe').addEventListener('click', () => { if (state.scanning || state.cleaning || state.analysisBusy) return; visibleItems().filter((item) => item.selectedByDefault === true).forEach((item) => state.selected.add(item.id)); render(); });
     $('clear-selection').addEventListener('click', () => { if (state.scanning || state.cleaning || state.analysisBusy) return; state.selected.clear(); render(); });
     $('review-cleanup').addEventListener('click', openReview);
     $('dialog-cancel').addEventListener('click', closeReview);

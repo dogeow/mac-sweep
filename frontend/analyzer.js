@@ -22,6 +22,7 @@
     return `${(number / 1000 ** index).toLocaleString('zh-CN', { maximumFractionDigits: 1 })} ${units[index]}`;
   };
   const sizeKnown = (node) => node?.sizeKnown !== false;
+  const snapshotComparable = (node) => sizeKnown(node) && node.sizeSource === 'scan' && !node.partial && !node.stale;
   const sizeLabel = (node) => !sizeKnown(node) ? '待分析' : node.partial && !node.bytes ? '大小未知' : formatBytes(node.bytes);
   function measuredTime(report) {
     const timestamp = report?.measuredAt;
@@ -29,6 +30,12 @@
     const date = new Date(timestamp);
     if (!Number.isFinite(date.getTime())) return '';
     return ` · 统计于 ${date.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })}`;
+  }
+  function availableText(report) {
+    const system = report?.storage?.availableBytes;
+    if (typeof system === 'number' && Number.isFinite(system) && system >= 0) return ` · 系统可用 ${formatBytes(system)}`;
+    const filesystem = report?.availableBytes;
+    return typeof filesystem === 'number' && Number.isFinite(filesystem) && filesystem >= 0 ? ` · 文件系统可用 ${formatBytes(filesystem)}` : '';
   }
   function storageAccounting(node, report) {
     const storage = report?.storage;
@@ -44,8 +51,9 @@
   }
   function renderStorageDetails(accounting) {
     const coverage = current()?.report;
+    const hasDetailedWaits = coverage?.directoryTimeoutCount !== undefined || coverage?.directoryWorkerLimitCount !== undefined;
     const otherErrors = Math.max(0, Number(coverage?.otherErrorCount || 0) - Number(coverage?.blockedDirectoryCount || 0));
-    const issues = [Number(coverage?.permissionDeniedCount || 0) ? `无权读取 ${Number(coverage.permissionDeniedCount).toLocaleString()} 处` : '', otherErrors ? `其他读取失败 ${otherErrors.toLocaleString()} 处` : '', Number(coverage?.skippedMountCount || 0) ? `跳过其他挂载 ${Number(coverage.skippedMountCount).toLocaleString()} 处` : '', Number(coverage?.changedDirectoryCount || 0) ? `扫描期间变化 ${Number(coverage.changedDirectoryCount).toLocaleString()} 处` : '', Number(coverage?.depthLimitedCount || 0) ? `未继续展开 ${Number(coverage.depthLimitedCount).toLocaleString()} 处` : '', Number(coverage?.cloudPlaceholderCount || 0) ? `${Number(coverage.cloudPlaceholderCount).toLocaleString()} 处云盘在线占位（未下载）` : '', Number(coverage?.blockedDirectoryCount || 0) ? `受保护目录未读取 ${Number(coverage.blockedDirectoryCount).toLocaleString()} 处` : ''].filter(Boolean);
+    const issues = [Number(coverage?.permissionDeniedCount || 0) ? `无权读取 ${Number(coverage.permissionDeniedCount).toLocaleString()} 处` : '', otherErrors ? `其他读取失败 ${otherErrors.toLocaleString()} 处` : '', Number(coverage?.skippedMountCount || 0) ? `跳过其他挂载 ${Number(coverage.skippedMountCount).toLocaleString()} 处` : '', Number(coverage?.changedDirectoryCount || 0) ? `扫描期间变化 ${Number(coverage.changedDirectoryCount).toLocaleString()} 处` : '', Number(coverage?.depthLimitedCount || 0) ? `未继续展开 ${Number(coverage.depthLimitedCount).toLocaleString()} 处` : '', Number(coverage?.cloudPlaceholderCount || 0) ? `${Number(coverage.cloudPlaceholderCount).toLocaleString()} 处云盘在线占位（未下载）` : '', Number(coverage?.directoryTimeoutCount || 0) ? `系统等待超时 ${Number(coverage.directoryTimeoutCount).toLocaleString()} 处` : '', Number(coverage?.directoryWorkerLimitCount || 0) ? `读取名额已满 ${Number(coverage.directoryWorkerLimitCount).toLocaleString()} 处` : '', Number(coverage?.hardLinkLimitCount || 0) ? `硬链接占用未确认 ${Number(coverage.hardLinkLimitCount).toLocaleString()} 处，大小仅含已确认部分` : '', !hasDetailedWaits && Number(coverage?.blockedDirectoryCount || 0) ? `受保护目录未读取 ${Number(coverage.blockedDirectoryCount).toLocaleString()} 处` : ''].filter(Boolean);
     $('analysis-storage-info').classList.toggle('hidden', !accounting && !issues.length);
     $('analysis-storage-info').querySelector('summary').textContent = accounting ? '空间统计说明' : '扫描说明';
     if (!accounting) { $('analysis-space-details').innerHTML = issues.length ? `<p>本次分析：${escape(issues.join(' · '))}</p><p>只统计能够读取的本机文件块。${Number(coverage?.cloudPlaceholderCount || 0) ? '云盘在线内容未下载，不按云端文件大小计入本机占用。' : ''}</p>` : ''; return; }
@@ -79,6 +87,22 @@
   function alignBreadcrumbs() {
     const breadcrumbs = $('analysis-breadcrumbs');
     breadcrumbs.scrollLeft = breadcrumbs.scrollWidth;
+    updateBreadcrumbNavigation();
+  }
+  function updateBreadcrumbNavigation() {
+    const breadcrumbs = $('analysis-breadcrumbs');
+    const maximum = Math.max(0, (Number(breadcrumbs.scrollWidth) || 0) - (Number(breadcrumbs.clientWidth) || 0));
+    const offset = Number(breadcrumbs.scrollLeft) || 0;
+    const previous = $('analysis-breadcrumb-previous'), next = $('analysis-breadcrumb-next');
+    if (previous) { previous.classList.toggle('hidden', maximum <= 1); previous.disabled = offset <= 1; }
+    if (next) { next.classList.toggle('hidden', maximum <= 1); next.disabled = offset >= maximum - 1; }
+  }
+  function scrollBreadcrumbs(direction) {
+    const breadcrumbs = $('analysis-breadcrumbs');
+    const distance = direction * Math.max(80, (Number(breadcrumbs.clientWidth) || 0) * .7);
+    if (typeof breadcrumbs.scrollBy === 'function') breadcrumbs.scrollBy({ left: distance, behavior: window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
+    else breadcrumbs.scrollLeft = (Number(breadcrumbs.scrollLeft) || 0) + distance;
+    updateBreadcrumbNavigation();
   }
   const errorText = (error) => typeof error === 'string' ? error : error?.message || '操作未能完成。';
   const originOf = (report) => report.sourceAnalysisId || report.analysisId;
@@ -203,10 +227,10 @@
   function renderChart(node) {
     state.chartNodes.clear();
     if (!node) return;
-    if (node.stale) {
-      $('analysis-chart').innerHTML = `<svg viewBox="0 0 340 340" aria-hidden="true"><circle cx="170" cy="170" r="107" fill="none" stroke="var(--disk-track)" stroke-width="70"/></svg><div class="chart-center"><strong>${sizeLabel(node)}</strong><span>已有统计</span><small>占用需更新</small></div>`;
+    if (node.stale || node.sizeSource === 'cached' || current()?.report.cachedBrowse === true) {
+      $('analysis-chart').innerHTML = `<svg viewBox="0 0 340 340" aria-hidden="true"><circle cx="170" cy="170" r="107" fill="none" stroke="var(--disk-track)" stroke-width="70"/></svg><div class="chart-center"><strong>${sizeLabel(node)}</strong><span>${sizeKnown(node) ? '已有统计' : '目录大小待分析'}</span><small>请完整分析</small></div>`;
       $('analysis-chart-key').innerHTML = '';
-      $('analysis-chart-caption').textContent = '目录内容有变化，重新分析可更新占用。';
+      $('analysis-chart-caption').textContent = sizeKnown(node) ? '目录列表是当前内容，占用来自已有统计。完整分析后可查看大小分布。' : '目录列表是当前内容。完整分析后可查看大小分布。';
       return;
     }
     const busy = app.isBusy();
@@ -415,20 +439,22 @@
     const pages = Math.max(1, Math.ceil(children.length / PAGE_SIZE));
     state.page = Math.min(Math.max(1, state.page), pages);
     const shown = children.slice((state.page - 1) * PAGE_SIZE, state.page * PAGE_SIZE);
-    const omittedBytes = Math.max(0, node.bytes - children.reduce((total, child) => total + child.bytes, 0));
+    const childBytes = children.reduce((total, child) => total + child.bytes, 0);
+    const canInferOmitted = snapshotComparable(node) && children.every((child) => snapshotComparable(child)) && childBytes <= node.bytes;
+    const omittedBytes = canInferOmitted ? node.bytes - childBytes : null;
     $('analysis-current-name').textContent = friendlyName(node);
     $('analysis-child-count').textContent = `占用 ${sizeLabel(node)}${node.partial && sizeKnown(node) ? ' · 仅统计已读取' : ''}`;
     $('analysis-rows').innerHTML = shown.map((child) => {
       const directory = child.kind === 'directory';
       const known = sizeKnown(child);
-      const knownProportion = known && sizeKnown(node) && !node.stale && !child.stale;
+      const knownProportion = snapshotComparable(node) && snapshotComparable(child) && child.bytes <= node.bytes;
       const proportion = knownProportion && node.bytes > 0 ? child.bytes / node.bytes * 100 : 0;
       const subtitle = !known ? '<small>目录大小尚未统计</small>' : child.stale ? '<small>占用需更新</small>' : child.partial ? '<small>部分未读取</small>' : child.kind === 'symlink' ? '<small>快捷链接</small>' : '';
       const caption = state.showDetails ? child.path : `${directory ? '打开' : '在 Finder 中显示'}${friendlyName(child)}`;
       const filled = directory && Boolean(favorites?.has(child.path));
       const favoriteAction = directory && favorites ? `<button class="analysis-favorite-action favorite-toggle${filled ? ' is-favorite' : ''}" data-analysis-favorite="${escape(child.id)}" aria-label="${filled ? '取消收藏' : '收藏'} ${escape(friendlyName(child))}" aria-pressed="${filled}" title="${filled ? '取消收藏' : '收藏目录'}" ${busy || !favorites.canEdit() || !app.desktop || app.demo ? 'disabled' : ''}>${favorites.icon(filled)}</button>` : '';
-      return `<tr data-analysis-row="${escape(child.id)}"><td><div class="analysis-name-cell"><button class="analysis-node-name" data-analysis-node="${escape(child.id)}" ${busy ? 'disabled' : ''} title="${escape(caption)}">${icon(directory ? 'folder' : 'file')}<span>${escape(friendlyName(child))}${subtitle}</span>${directory ? '<b>›</b>' : ''}</button>${favoriteAction}</div></td><td class="analysis-size">${sizeLabel(child)}</td><td class="analysis-percentage"><span>${knownProportion ? `${proportion < .1 && proportion > 0 ? '&lt;0.1' : proportion.toFixed(1)}%` : '待分析'}</span>${knownProportion ? `<i data-percent="${Math.min(100, proportion)}"></i>` : ''}</td><td class="analysis-file-count">${known ? Number(child.files || 0).toLocaleString() : '—'}</td><td class="analysis-more-action"><button class="row-reveal" data-analysis-reveal="${escape(child.id)}" title="在 Finder 中找到" aria-label="在 Finder 中找到 ${escape(child.name)}" ${busy || !app.desktop || app.demo ? 'disabled' : ''}>${icon('folder')}</button></td></tr>`;
-    }).join('') + (node.omittedChildren > 0 && state.page === pages ? `<tr class="analysis-omitted"><td>其他未展开项目<small>${Number(node.omittedChildren).toLocaleString()} 个子项</small></td><td class="analysis-size">${!sizeKnown(node) ? '待分析' : node.partial ? '未知' : formatBytes(omittedBytes)}</td><td colspan="3">${!sizeKnown(node) ? '目录大小尚未统计' : node.partial ? '已读取部分计入总占用；未读取占用未知' : '省略的显示项目已计入总占用'}</td></tr>` : '') + (state.page === pages ? accountingRows(accounting) : '');
+      return `<tr data-analysis-row="${escape(child.id)}"><td><div class="analysis-name-cell"><button class="analysis-node-name" data-analysis-node="${escape(child.id)}" ${busy ? 'disabled' : ''} title="${escape(caption)}">${icon(directory ? 'folder' : 'file')}<span>${escape(friendlyName(child))}${subtitle}</span>${directory ? '<b>›</b>' : ''}</button>${favoriteAction}</div></td><td class="analysis-size">${sizeLabel(child)}</td><td class="analysis-percentage"><span>${knownProportion ? `${proportion < .1 && proportion > 0 ? '&lt;0.1' : proportion.toFixed(1)}%` : known && sizeKnown(node) ? '—' : '待分析'}</span>${knownProportion ? `<i data-percent="${Math.min(100, proportion)}"></i>` : ''}</td><td class="analysis-file-count">${known ? Number(child.files || 0).toLocaleString() : '—'}</td><td class="analysis-more-action"><button class="row-reveal" data-analysis-reveal="${escape(child.id)}" title="在 Finder 中找到" aria-label="在 Finder 中找到 ${escape(child.name)}" ${busy || !app.desktop || app.demo ? 'disabled' : ''}>${icon('folder')}</button></td></tr>`;
+    }).join('') + (node.omittedChildren > 0 && state.page === pages ? `<tr class="analysis-omitted"><td>其他未展开项目<small>${Number(node.omittedChildren).toLocaleString()} 个子项</small></td><td class="analysis-size">${omittedBytes === null ? '未知' : formatBytes(omittedBytes)}</td><td colspan="3">${omittedBytes === null ? '子项与已有总量不是同次统计，无法推算' : '省略的显示项目已计入总占用'}</td></tr>` : '') + (state.page === pages ? accountingRows(accounting) : '');
     $('analysis-rows').querySelectorAll('[data-percent]').forEach((element) => { element.style.width = `${Number(element.dataset.percent) || 0}%`; });
     $('analysis-empty').classList.toggle('hidden', children.length > 0 || node.omittedChildren > 0 || hasAccountingRows);
     if (!children.length && !node.omittedChildren && !hasAccountingRows) {
@@ -439,7 +465,7 @@
     $('analysis-table-footer').classList.toggle('has-pages', pages > 1);
     $('analysis-table-footer').innerHTML = pages > 1 ? `<span>${first}–${Math.min(state.page * PAGE_SIZE, children.length)} / ${children.length} 项</span><div class="pagination"><button class="page-button" data-analysis-page="previous" ${state.page <= 1 || busy ? 'disabled' : ''}>上一页</button><span>${state.page} / ${pages}</span><button class="page-button" data-analysis-page="next" ${state.page >= pages || busy ? 'disabled' : ''}>下一页</button></div>` : '';
     $('analysis-status').textContent = (accounting ? `系统已用 ${formatBytes(accounting.storage.usedBytes)} · ${accounting.differentMeasurement ? '文件块统计' : '已定位文件'} ${formatBytes(accounting.located)} · ${accounting.differentMeasurement ? '计量不同' : `未定位 ${formatBytes(accounting.unlocated)}`}` : `${friendlyName(node)} · ${sizeLabel(node)}${sizeKnown(node) && (entry.browsed || entry.cached) ? ' · 已有统计' : ''}${node.partial && sizeKnown(node) ? ' · 仅统计已读取' : ''} · 不会修改文件`) + (node.stale || entry.stale ? ' · 占用需更新' : '');
-    $('analysis-snapshot').textContent = entry.browsed || entry.cached ? `${sizeKnown(node) ? `${Number(node.files || 0).toLocaleString()} 个文件 · 已有统计${measuredTime(entry.report)}` : '目录大小待分析'}${entry.browsed ? ` · 打开耗时 ${(Number(entry.report.durationMs || 0) / 1000).toFixed(1)} 秒` : ''}` : `${Number(entry.report.scannedFiles || 0).toLocaleString()} 个文件 · ${(Number(entry.report.durationMs || 0) / 1000).toFixed(1)} 秒${entry.report.availableBytes >= 0 ? ` · 磁盘可用 ${formatBytes(entry.report.availableBytes)}` : ''}`;
+    $('analysis-snapshot').textContent = entry.browsed || entry.cached ? `${sizeKnown(node) ? `${Number(node.files || 0).toLocaleString()} 个文件 · 已有统计${measuredTime(entry.report)}` : '目录大小待分析'}${entry.browsed ? ` · 打开耗时 ${(Number(entry.report.durationMs || 0) / 1000).toFixed(1)} 秒` : ''}` : `${Number(entry.report.scannedFiles || 0).toLocaleString()} 个文件 · ${(Number(entry.report.durationMs || 0) / 1000).toFixed(1)} 秒${availableText(entry.report)}`;
     if (node.stale || entry.stale) $('analysis-snapshot').textContent += ' · 占用需更新';
     const warnings = [...new Set([...(entry.report.warnings || []), ...(entry.report.storage?.warnings || []), ...(typeof entry.report.storageWarning === 'string' ? [entry.report.storageWarning] : [])])];
     if (accounting?.differentMeasurement) warnings.unshift('文件块统计与系统计量不同，可能包含共享块重复计量。当前占用图只展示文件夹统计，不能与系统已用空间直接相减。');
@@ -468,6 +494,7 @@
     const parents = navigation.parentsForScan(state.history, path, append, parentHistory);
     const revision = ++state.revision;
     state.scanning = true;
+    if ($('analysis-progress-announcement')) $('analysis-progress-announcement').textContent = '开始分析目录。';
     state.cancelling = false;
     state.message = null;
     state.scanPath = path;
@@ -489,12 +516,12 @@
         timing?.finish();
         renderProgress();
         const files = report.scannedFiles;
-        if (Number.isSafeInteger(files) && files >= 1000 && !report.cachedBrowse && (!report.sourceAnalysisId || report.sourceAnalysisId === report.analysisId)) {
+        if (Number.isSafeInteger(files) && files >= 1000 && report.scanComplete === true && report.root.partial !== true && report.root.sizeSource === 'scan' && !report.cachedBrowse && report.sourceAnalysisId === report.analysisId && report.root.path === path) {
           scanEstimates.delete(path);
           scanEstimates.set(path, files);
           if (scanEstimates.size > 16) scanEstimates.delete(scanEstimates.keys().next().value);
-        }
-      }
+        } else scanEstimates.delete(path);
+      } else scanEstimates.delete(path);
       // Results opened from an older analysis must not survive a fresh source scan.
       state.browseCache.clear();
       const entry = { node: report.root, report, page: 1 };
@@ -506,9 +533,9 @@
       state.page = 1;
       updateLocations();
     } catch (error) {
-      if (revision === state.revision) message('error', `目录扫描未完成：${errorText(error)}${current() ? ' 已保留上次结果。' : ''}`);
+      if (revision === state.revision) { scanEstimates.delete(path); message('error', `目录扫描未完成：${errorText(error)}${current() ? ' 已保留上次结果。' : ''}`); }
     } finally {
-      if (revision === state.revision) { state.scanning = false; state.cancelling = false; stopProgressTimer(); app.setAnalysisBusy(false); render(); }
+      if (revision === state.revision) { state.scanning = false; state.cancelling = false; stopProgressTimer(); app.setAnalysisBusy(false); render(); if ($('analysis-progress-announcement')) $('analysis-progress-announcement').textContent = state.message?.type === 'error' ? '目录分析未完成，请查看提示。' : '本轮目录分析已结束，请查看结果。'; }
     }
   }
   function rememberBrowse(key, report) {
@@ -563,7 +590,7 @@
           message('info', '这个项目已变化，列表暂时无法更新。重新分析可更新占用。');
           return;
         }
-        if (state.cancelling || report.cancelled) { message('info', '已停止更新列表，已有统计需要重新分析。'); return; }
+        if (report.cancelled) { message('info', '已停止更新列表，已有统计需要重新分析。'); return; }
         if (listingFailed(report)) {
           if (current()?.invalid) { state.history = history.slice(0, index + 1); state.path = candidate.node.path; state.page = candidate.page || 1; updateLocations(); }
           message('info', '这个项目已变化。' + (Number(report.permissionDeniedCount) > 0 ? '暂时无法读取列表，请检查访问权限后重试。' : '暂时无法读取列表，请稍后重试。') + '已保留已有结果。');
@@ -593,10 +620,6 @@
   async function browseDirectory(node, parents, sourceReport) {
     if (!app.desktop || app.demo || app.isBusy() || !sourceReport?.analysisId) return;
     const cacheKey = `${sourceReport.analysisId}\u0000${node.id}`;
-    const cached = state.browseCache.get(cacheKey);
-    if (cached) {
-      return openCachedDirectory(node, parents, sourceReport, cached);
-    }
     const contextEntry = current();
     const revision = ++state.revision;
     state.browsing = true;
@@ -612,55 +635,10 @@
       const report = await invoke('browse_analysis_directory', { analysisId: sourceReport.analysisId, nodeId: node.id });
       if (revision !== state.revision) return;
       if (!validReport(report) || report.root.id !== node.id || report.root.path !== node.path || report.root.kind !== 'directory') throw new Error('打开目录返回的结果格式无效。');
-      if (state.cancelling || report.cancelled) { message('info', '已停止打开目录，保留当前结果。'); return 'cancelled'; }
+      if (report.cancelled) { message('info', '已停止打开目录，保留当前结果。'); return 'cancelled'; }
       if (listingFailed(report)) { message('error', (Number(report.permissionDeniedCount) > 0 ? '暂时无法读取这个目录，请检查访问权限后重试。' : '暂时无法读取这个目录，请稍后重试。') + '已保留当前结果。'); return 'error'; }
       commitBrowse(parents, report);
       rememberBrowse(cacheKey, report);
-      return 'opened';
-    } catch (error) {
-      if (revision === state.revision) {
-        const invalid = invalidStatus(error);
-        if (invalid) { await recoverInvalidNode(node, sourceReport, contextEntry, invalid, revision); return 'unavailable'; }
-        message('error', friendlyFailure(error, '打开这个目录', true));
-        return /过期|expired/i.test(errorText(error)) ? 'expired' : 'error';
-      }
-    } finally {
-      if (revision === state.revision) { state.browsing = false; state.cancelling = false; app.setAnalysisBusy(false); render(); }
-    }
-  }
-  async function openCachedDirectory(node, parents, sourceReport, cachedReport = null, cachedHistory = null) {
-    if (!app.desktop || app.demo || app.isBusy()) return;
-    const contextEntry = current();
-    const revision = ++state.revision;
-    state.browsing = true;
-    state.cancelling = false;
-    state.message = null;
-    state.scanPath = node.path;
-    closeOptions();
-    app.setAnalysisBusy(true);
-    render();
-    try {
-      const result = await invoke('inspect_analysis_node', { analysisId: sourceReport.analysisId, nodeId: node.id });
-      if (revision !== state.revision) return;
-      if (state.cancelling) { message('info', '已停止打开目录，保留当前结果。'); return 'cancelled'; }
-      if (result?.status === 'missing' || result?.status === 'changed') {
-        await recoverInvalidNode(node, sourceReport, contextEntry, result.status, revision);
-        return 'unavailable';
-      }
-      if (result?.status !== 'ready') throw new Error('无法验证目录状态。');
-      if (node.unavailable || state.invalidatedNodes.get(originOf(sourceReport))?.has(node.id)) {
-        await recoverInvalidNode(node, sourceReport, contextEntry, 'changed', revision);
-        return 'unavailable';
-      }
-      if (cachedReport) commitBrowse(parents, cachedReport);
-      else {
-        for (const item of cachedHistory.slice(state.history.length)) item.cached = true;
-        state.history = cachedHistory;
-        state.path = node.path;
-        state.page = 1;
-        state.emptyReason = null;
-        updateLocations();
-      }
       return 'opened';
     } catch (error) {
       if (revision === state.revision) {
@@ -709,7 +687,7 @@
     let result;
     if (historyIndex >= 0) {
       const target = state.history[historyIndex];
-      result = await openCachedDirectory(target.node, state.history.slice(0, historyIndex), target.report, null, state.history.slice(0, historyIndex + 1));
+      result = await browseDirectory(target.node, state.history.slice(0, historyIndex), target.report);
     } else {
       const entry = current();
       const pending = entry ? [entry.node] : [];
@@ -721,7 +699,7 @@
       }
       if (target) {
         const plan = navigation.drillPlan(state.history, target);
-        if (plan) result = plan.needsScan ? await browseDirectory(target, plan.parents, entry.report) : await openCachedDirectory(target, plan.parents, entry.report, null, plan.history);
+        if (plan) result = await browseDirectory(target, plan.parents, entry.report);
       }
     }
     if (favoriteRevision !== state.favoriteRevision || app.getView() !== 'analysis') return false;
@@ -740,7 +718,7 @@
     let opened = false;
     try {
       const report = await invoke('open_favorite_directory', { favoriteId });
-      if (revision !== state.revision || favoriteRevision !== state.favoriteRevision || state.cancelling) return false;
+      if (revision !== state.revision || favoriteRevision !== state.favoriteRevision) return false;
       if (!validReport(report) || report.root.kind !== 'directory' || report.root.path !== favorite.path) throw new Error('收藏目录结果格式无效。');
       if (report.cancelled) return false;
       if (listingFailed(report)) throw new Error(Number(report.permissionDeniedCount) > 0 ? '目录访问权限不足。' : '目录暂时无法读取。');
@@ -781,12 +759,12 @@
     const home = state.locations.find(item => item.id === 'home')?.path;
     const roots = home ? [home, `/System/Volumes/Data${home}`] : [];
     const blocked = ['Library','Desktop','Documents','Downloads','Pictures','Music','Movies','Library/Preferences','Library/Containers','Library/Group Containers','Library/Application Support'];
-    const canTrash = roots.some(root => {
+    const canTrash = ['file', 'directory'].includes(node.kind) && roots.some(root => {
       if (!node.path.startsWith(`${root}/`)) return false;
       const relative = node.path.slice(root.length + 1).toLowerCase();
       return !blocked.some(path => path.toLowerCase() === relative) && !['.Trash','.ssh','.gnupg','Library/Keychains'].some(path => relative === path.toLowerCase() || relative.startsWith(`${path.toLowerCase()}/`));
     });
-    return { analysisId: entry.report.analysisId, nodeId: node.id, path: node.path, name: node.name, kind: node.kind, bytes: node.bytes, sizeKnown: sizeKnown(node), canTrash };
+    return { analysisId: entry.report.analysisId, nodeId: node.id, path: node.path, name: node.name, kind: node.kind, bytes: node.bytes, sizeKnown: sizeKnown(node), canTrash, trashReason: node.kind === 'symlink' ? '符号链接请在 Finder 中处理。' : canTrash ? '' : '此项目不支持移到废纸篓。' };
   }
   async function trashTarget(id) {
     const target = contextTarget(id), entry = current(), node = findNode(id);
@@ -803,22 +781,32 @@
       app.setAnalysisBusy(true);
       $('app-status').textContent = '等待移动确认';
       $('analysis-status').textContent = '确认后，所选项目会移到废纸篓';
-      $('analysis-trash-dialog').showModal();
-      $('analysis-trash-cancel').focus();
+      try {
+        const dialog = $('analysis-trash-dialog');
+        const opened = window.macSweepDialogs ? window.macSweepDialogs.open(dialog, { initialFocus: $('analysis-trash-cancel') }) : (typeof dialog.showModal === 'function' && (dialog.showModal(), true));
+        if (!opened) throw new Error('确认窗口无法显示。');
+        $('analysis-trash-cancel').focus();
+      } catch (_error) {
+        trashDialogRequest = null;
+        app.setAnalysisBusy(false);
+        message('error', '确认窗口暂时无法打开，没有移动任何内容。请稍后重试。');
+        resolve(false);
+      }
     });
   }
   function closeTrashDialog(result) {
     const request = trashDialogRequest;
     if (!request) return;
     trashDialogRequest = null;
-    $('analysis-trash-dialog').close();
+    if (window.macSweepDialogs) window.macSweepDialogs.close($('analysis-trash-dialog'));
+    else if (typeof $('analysis-trash-dialog').close === 'function') $('analysis-trash-dialog').close();
     app.setAnalysisBusy(false);
     render();
     request.resolve(result);
   }
   async function confirmAnalysisTrash() {
     const request = trashDialogRequest;
-    if (!request || request.moving) return;
+    if (!request || request.moving || request.uncertain) return;
     request.moving = true;
     $('analysis-trash-confirm').disabled = true;
     $('analysis-trash-cancel').disabled = true;
@@ -832,7 +820,11 @@
       await recoverInvalidNode(request.node, request.entry.report, request.entry, result.status === 'changed' ? 'changed' : 'missing');
       if (result.status === 'moved') message('info', '已移到废纸篓，列表已更新。重新分析可更新占用。');
     } catch (error) {
-      closeTrashDialog(false);
+      request.moving = false;
+      request.uncertain = true;
+      $('analysis-trash-confirm').disabled = true;
+      $('analysis-trash-cancel').disabled = false;
+      $('analysis-trash-status').textContent = '移动未能确认。请先在 Finder 检查文件状态，再重新分析；此次不会重试。';
       message('error', '移动未能确认，请在 Finder 检查文件状态后再操作。');
     }
   }
@@ -844,8 +836,7 @@
     if (entry) entry.page = state.page;
     const plan = navigation.drillPlan(state.history, node);
     if (!plan) return;
-    if (plan.needsScan) { browseDirectory(node, plan.parents, entry.report); return; }
-    openCachedDirectory(node, plan.parents, entry.report, null, plan.history);
+    browseDirectory(node, plan.parents, entry.report);
   }
   function goBack(index) {
     if (state.scanning || app.isBusy()) return;
@@ -856,12 +847,8 @@
     }
     const history = navigation.returnTo(state.history, index);
     if (history === state.history) return;
-    state.history = history;
-    state.path = current().node.path;
-    state.page = current().page || 1;
-    state.message = null;
-    updateLocations();
-    render();
+    const target = history[history.length - 1];
+    browseDirectory(target.node, history.slice(0, -1), target.report);
   }
   async function chooseFolder() {
     if (!app.desktop || app.demo || app.isBusy()) return;
@@ -876,6 +863,9 @@
     catch (error) { message('error', `无法打开系统设置：${errorText(error)}。请按“更多”中的路径手动打开。`); }
   }
   function bind() {
+    $('analysis-breadcrumb-previous')?.addEventListener('click', () => scrollBreadcrumbs(-1));
+    $('analysis-breadcrumb-next')?.addEventListener('click', () => scrollBreadcrumbs(1));
+    $('analysis-breadcrumbs').addEventListener('scroll', updateBreadcrumbNavigation);
     $('analysis-favorite')?.addEventListener('click', () => toggleFavorite());
     $('analysis-permissions').addEventListener('click', openPrivacySettings);
     $('analysis-chart-toggle').addEventListener('click', () => { state.showChart = !state.showChart; closeOptions(true); render(); });

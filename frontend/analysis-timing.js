@@ -105,7 +105,7 @@
       const clock = `${String(minutes).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
       return `预计剩余 ${hours ? `${hours}:${clock}` : clock}`;
     }
-    return ({ preparing: '正在估算剩余时间…', recalculating: '正在更新预计时间…', waiting: '正在更新预计时间…', finishing: '正在完成统计…', complete: '本轮分析已完成' })[value.kind] || '';
+    return ({ preparing: '正在估算剩余时间…', recalculating: '正在更新预计时间…', waiting: '正在更新预计时间…', finishing: '正在核对剩余内容…', complete: '本轮分析已完成' })[value.kind] || '';
   }
   const api = { create, format };
   if (typeof module === 'object' && module.exports) module.exports = api;

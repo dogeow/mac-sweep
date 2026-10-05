@@ -8,8 +8,8 @@ const cleanupModel = require('../frontend/cleanup-model.js');
 const decode = (value) => value.replaceAll('&quot;', '"').replaceAll('&#39;', "'").replaceAll('&lt;', '<').replaceAll('&gt;', '>').replaceAll('&amp;', '&');
 const candidate = (id, bytes) => ({ id, path: `/example/Library/Caches/App/${id}`, name: id, appName: 'App', category: 'cache', risk: 'low', bytes, files: 1, modifiedAt: 1, reason: 'Old test cache', selectedByDefault: true });
 const candidates = [candidate('one', 1000), candidate('two', 2000)];
-const moved = (item) => ({ id: item.id, path: item.path, bytes: item.bytes, error: null });
-const failed = (item, error = '关联应用正在运行') => ({ ...moved(item), error });
+const moved = (item) => ({ id: item.id, path: item.path, bytes: item.bytes, error: null, outcome: 'moved' });
+const failed = (item, error = '关联应用正在运行') => ({ ...moved(item), error, outcome: 'failed' });
 
 async function harness(options = {}) {
   const document = { activeElement: null, addEventListener() {} };
@@ -288,6 +288,10 @@ test('rejected or incomplete cleanup receipts remain unknown and preserve select
   for (const response of [async () => { throw new Error('Native connection interrupted'); }, { moved: [moved(candidates[0])], failed: [], bytesMoved: 1000 }, { moved: [moved(candidates[0]), moved(candidates[0])], failed: [], bytesMoved: 2000 }]) {
     const h = await harness();
     await h.clean(response);
+    assert.equal(h.elements.get('cleanup-dialog').open, true);
+    assert.equal(h.elements.get('dialog-confirm').disabled, true);
+    assert.equal(h.elements.get('dialog-cancel').disabled, false);
+    h.elements.get('dialog-cancel').click();
     assert.equal(h.bottom.classList.contains('error'), true);
     assert.match(h.bottom.innerHTML, /清理结果未确认，请检查文件状态/);
     assert.equal(h.bottom.innerHTML.includes('原文件已保留'), false);
@@ -296,8 +300,7 @@ test('rejected or incomplete cleanup receipts remain unknown and preserve select
     assert.equal(h.elements.get('receipt-panel').classList.contains('hidden'), true);
     assert.equal(h.control('data-cleanup-view-records').disabled, true);
     assert.equal(h.control('data-cleanup-open-trash').disabled, false);
-    h.elements.get('review-cleanup').click();
-    assert.equal(h.elements.get('dialog-count').textContent, '2 个项目');
+    assert.equal(h.elements.get('review-cleanup').disabled, true);
   }
 });
 
@@ -337,4 +340,66 @@ test('pending cleanup hides its old result and disables the fallback record acti
   assert.match(h.bottom.innerHTML, /1 项未完成，选择已保留/);
   assert.equal(h.bottom.innerHTML.includes('原文件已保留'), false);
   assert.equal(h.elements.get('show-receipts').classList.contains('hidden'), true);
+});
+
+test('selecting suggested items respects the current search while confirmation exposes older hidden selection', async () => {
+  const h = await harness();
+  h.elements.get('clear-selection').click();
+  h.elements.get('search').listeners.get('input')({ target: { value: 'one' } });
+  h.elements.get('select-safe').click();
+  h.elements.get('review-cleanup').click();
+  assert.equal(h.elements.get('dialog-count').textContent, '1 个项目');
+  h.elements.get('dialog-cancel').click();
+  h.elements.get('search').listeners.get('input')({ target: { value: 'two' } });
+  h.elements.get('select-safe').click();
+  h.elements.get('review-cleanup').click();
+  assert.match(h.elements.get('dialog-count').textContent, /2 个项目.*其中 1 项不在当前筛选结果中/);
+  h.elements.get('dialog-cancel').click();
+  h.elements.get('search').listeners.get('input')({ target: { value: 'nothing matches' } });
+  assert.equal(h.elements.get('select-safe').disabled, true);
+});
+
+test('per-item unknown movement cannot be dismissed, cleared or failed-rescanned into a retry', async () => {
+  const h = await harness();
+  await h.clean({ moved: [moved(candidates[0])], failed: [{ ...failed(candidates[1]), outcome: 'unknown' }], bytesMoved: 1000 });
+  assert.equal(h.elements.get('cleanup-dialog').open, true);
+  assert.equal(h.elements.get('dialog-confirm').disabled, true);
+  h.elements.get('dialog-cancel').click();
+  assert.match(h.bottom.innerHTML, /已移到废纸篓 1 项.*1 项移动结果未确认/);
+  assert.equal(h.elements.get('result-rows').innerHTML.includes('1 项未能移动'), false);
+  const attempts = h.calls.filter(call => call.command === 'clean_items').length;
+  h.clickOutcome('data-cleanup-dismiss');
+  assert.equal(h.elements.get('review-cleanup').disabled, true);
+  h.elements.get('clear-receipts').click();
+  assert.equal(h.elements.get('review-cleanup').disabled, true);
+  h.reply('start_scan', async () => { throw new Error('cannot rescan'); });
+  h.window.macSweep.showCleanupAndScan(); await h.settle();
+  assert.equal(h.elements.get('review-cleanup').disabled, true);
+  h.elements.get('review-cleanup').click(); h.elements.get('dialog-confirm').click(); await h.settle();
+  assert.equal(h.calls.filter(call => call.command === 'clean_items').length, attempts);
+  h.reply('start_scan', async () => ({ scanId: 'new-verified-scan', startedAt: 2, items: candidates, warnings: [], cancelled: false }));
+  h.window.macSweep.showCleanupAndScan(); await h.settle();
+  assert.equal(h.elements.get('review-cleanup').disabled, false);
+});
+
+test('missing or misplaced outcome tags are rejected rather than classified as known movement', async () => {
+  for (const invalid of [{ ...moved(candidates[0]), outcome: undefined }, { ...moved(candidates[0]), outcome: 'unknown' }]) {
+    const h = await harness();
+    await h.clean({ moved: [invalid], failed: [failed(candidates[1])], bytesMoved: 1000 });
+    assert.equal(h.elements.get('cleanup-dialog').open, true);
+    assert.equal(h.elements.get('dialog-confirm').disabled, true);
+    assert.equal(h.elements.get('receipt-panel').classList.contains('hidden'), true);
+    h.elements.get('dialog-cancel').click();
+    assert.match(h.bottom.innerHTML, /清理结果未确认/);
+    assert.equal(h.bottom.innerHTML.includes('已移到废纸篓'), false);
+  }
+});
+
+test('missing confirmation support leaves no executable cleanup selection', async () => {
+  const h = await harness();
+  h.elements.get('cleanup-dialog').showModal = undefined;
+  h.elements.get('review-cleanup').click();
+  h.elements.get('dialog-confirm').click(); await h.settle();
+  assert.equal(h.calls.some(call => call.command === 'clean_items'), false);
+  assert.match(h.elements.get('message-panel').innerHTML, /确认窗口暂时无法打开.*没有移动/);
 });

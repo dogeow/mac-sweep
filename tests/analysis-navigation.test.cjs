@@ -25,19 +25,24 @@ test('idle and scan roots return home, while busy navigation stays disabled', ()
   assert.equal(navigation.backAction([root, child], true).disabled, true);
 });
 
-test('cached navigation returns the original parent data and saved page', () => {
+test('directory entry refresh plans preserve parent data and pages until a reply commits', () => {
   const deep = folder('deep', '/example/child/deep');
   const child = folder('child', '/example/child', [deep]);
   const root = entry(folder('root', '/example', [child], { bytes: 9000 }), 'original', { page: 3 });
   const initial = [root];
   const first = navigation.drillPlan(initial, child);
-  assert.equal(first.needsScan, false);
-  const second = navigation.drillPlan(first.history, deep);
-  assert.equal(second.needsScan, false);
+  assert.equal(first.needsScan, true);
+  assert.strictEqual(first.history, initial);
+  const refreshedChild = entry(child, 'fresh-child');
+  const childHistory = navigation.commitScan(first.parents, refreshedChild);
+  const second = navigation.drillPlan(childHistory, deep);
+  assert.equal(second.needsScan, true);
+  assert.strictEqual(second.history, childHistory);
+  const deepHistory = navigation.commitScan(second.parents, entry(deep, 'fresh-deep'));
   assert.equal(initial.length, 1);
-  const parentHistory = navigation.returnTo(second.history);
+  const parentHistory = navigation.returnTo(deepHistory);
   assert.strictEqual(navigation.current(parentHistory).node, child);
-  assert.strictEqual(navigation.current(parentHistory).report, root.report);
+  assert.strictEqual(navigation.current(parentHistory).report, refreshedChild.report);
   const rootHistory = navigation.returnTo(parentHistory);
   assert.strictEqual(navigation.current(rootHistory), root);
   assert.equal(navigation.current(rootHistory).page, 3);
@@ -74,7 +79,8 @@ test('deep unexpanded chart targets retain cached intermediate folders across re
 test('refreshing a nested folder keeps its parent and new locations start a new root', () => {
   const child = folder('child', '/example/child');
   const root = entry(folder('root', '/example', [child]));
-  const history = navigation.drillPlan([root], child).history;
+  const plan = navigation.drillPlan([root], child);
+  const history = navigation.commitScan(plan.parents, entry(child));
   const refreshed = entry(folder('child-new', child.path, [], { bytes: 8192 }), 'refresh');
   const refreshedHistory = navigation.commitScan(
     navigation.parentsForScan(history, child.path), refreshed,
@@ -90,6 +96,19 @@ test('refreshing a nested folder keeps its parent and new locations start a new 
   const anotherHistory = navigation.commitScan(newParents, another);
   assert.deepEqual(anotherHistory, [another]);
   assert.equal(navigation.backAction(anotherHistory).kind, 'home');
+});
+
+test('previously empty and already expanded folders both request fresh shallow entries', () => {
+  const empty = folder('empty', '/example/empty', [], { hasChildren: false });
+  const expanded = folder('expanded', '/example/expanded', [folder('file-dir', '/example/expanded/nested')]);
+  const root = entry(folder('root', '/example', [empty, expanded]));
+  const history = [root];
+  for (const child of [empty, expanded]) {
+    const plan = navigation.drillPlan(history, child);
+    assert.equal(plan.needsScan, true);
+    assert.strictEqual(plan.history, history);
+    assert.deepEqual(plan.parents, [root]);
+  }
 });
 
 test('invalid targets and current breadcrumbs cannot create phantom history entries', () => {

@@ -41,7 +41,7 @@ test('unknown work, warmup, waits and 99 percent cannot announce a zero-second f
   assert.equal(model.snapshot(21_000).kind, 'recalculating');
   model.observe(99, 22_000);
   assert.equal(model.snapshot(22_000).kind, 'finishing');
-  assert.equal(timing.format(model.snapshot(22_000)), '正在完成统计…');
+  assert.equal(timing.format(model.snapshot(22_000)), '正在核对剩余内容…');
   model.finish();
   assert.equal(model.snapshot(23_000).kind, 'complete');
   model.observe(10, 24_000);

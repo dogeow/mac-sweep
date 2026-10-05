@@ -7,6 +7,7 @@
     <title>Mac Sweep</title>
     <link rel="stylesheet" href="./style.css" />
     <script defer src="./cleanup-model.js"></script>
+    <script defer src="./modal-dialog.js"></script>
     <script defer src="./app.js"></script>
     <script defer src="./analysis-navigation.js"></script>
     <script defer src="./favorites.js"></script>
@@ -64,7 +65,7 @@
         <div class="analysis-demo hidden" id="analysis-demo">演示数据 · 本机文件不会被读取</div>
         <div class="analysis-browser-header">
           <button class="toolbar-button analysis-back-button" id="analysis-back" aria-label="返回我的 Mac" title="返回我的 Mac"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6" /></svg><span>返回</span></button>
-          <nav id="analysis-breadcrumbs" aria-label="目录层级"><span>文件夹</span></nav>
+          <div class="analysis-breadcrumb-navigation"><button class="breadcrumb-scroll hidden" id="analysis-breadcrumb-previous" aria-label="查看前面的目录层级" title="查看前面的目录层级">‹</button><nav id="analysis-breadcrumbs" aria-label="目录层级"><span>文件夹</span></nav><button class="breadcrumb-scroll hidden" id="analysis-breadcrumb-next" aria-label="查看后面的目录层级" title="查看后面的目录层级">›</button></div>
           <div class="analysis-location-choice" role="group" aria-label="扫描位置：选择常用位置或自选文件夹，二选一">
             <div class="analysis-location-control"><label for="analysis-location">扫描位置</label><div class="analysis-location-select"><span class="location-icon" data-icon="folder" aria-hidden="true"></span><select id="analysis-location" aria-label="常用扫描位置"><option value="">正在读取位置…</option></select><span class="location-chevron" data-icon="chevron-down" aria-hidden="true"></span></div></div>
             <span class="analysis-location-or" aria-hidden="true">或</span>
@@ -91,7 +92,8 @@
           </details>
         </div>
         <div class="analysis-path" id="analysis-selected-path">选择文件夹以查看实际占用</div>
-        <div class="analysis-progress hidden" id="analysis-progress" role="status" aria-live="polite"><span class="progress-spinner"></span><div><strong id="analysis-progress-label">正在计算大小…</strong><span id="analysis-progress-path" class="hidden" aria-hidden="true"></span><div class="analysis-meter hidden" id="analysis-progress-meter"><span class="analysis-meter-label" id="analysis-progress-percent"></span><div class="analysis-meter-track" id="analysis-progress-track"><div class="analysis-meter-fill" id="analysis-progress-fill"></div></div></div><span class="analysis-progress-eta" id="analysis-progress-eta" aria-live="off" title="按实际扫描进度估算，会随扫描速度调整。"></span></div><span id="analysis-progress-count"></span><button class="text-button" id="cancel-analysis">停止</button></div>
+        <div class="analysis-progress hidden" id="analysis-progress" aria-live="off"><span class="progress-spinner"></span><div><strong id="analysis-progress-label">正在计算大小…</strong><span id="analysis-progress-path" class="hidden" aria-hidden="true"></span><div class="analysis-meter hidden" id="analysis-progress-meter"><span class="analysis-meter-label" id="analysis-progress-percent"></span><div class="analysis-meter-track" id="analysis-progress-track"><div class="analysis-meter-fill" id="analysis-progress-fill"></div></div></div><span class="analysis-progress-eta" id="analysis-progress-eta" aria-live="off" title="按实际扫描进度估算，会随扫描速度调整。"></span></div><span id="analysis-progress-count"></span><button class="text-button" id="cancel-analysis">停止</button></div>
+        <div class="sr-only" id="analysis-progress-announcement" role="status" aria-live="polite"></div>
         <div class="analysis-message hidden" id="analysis-message" role="status" aria-live="polite"></div>
         <div class="analysis-notices hidden" id="analysis-notices"><details class="analysis-warnings hidden" id="analysis-warnings"><summary id="analysis-warning-summary">部分文件未能读取</summary><ul id="analysis-warning-list"></ul></details><button class="text-button hidden" id="analysis-permissions">查看访问权限</button></div>
         <div class="analysis-body">
@@ -132,6 +134,6 @@
       <button role="menuitem" data-analysis-context-action="trash">移到废纸篓…</button>
     </div>
     <dialog id="analysis-trash-dialog" aria-labelledby="analysis-trash-title"><div class="dialog-body"><h2 id="analysis-trash-title">移到废纸篓？</h2><strong id="analysis-trash-name"></strong><code class="analysis-trash-path" id="analysis-trash-path"></code><p id="analysis-trash-size"></p><p id="analysis-trash-scope"></p><p>建议先退出使用它的应用。移到废纸篓不会立即释放空间。</p><p id="analysis-trash-status" role="status" aria-live="polite"></p></div><div class="dialog-actions"><button class="button secondary" id="analysis-trash-cancel">保留文件</button><button class="button primary" id="analysis-trash-confirm">移到废纸篓</button></div></dialog>
-    <dialog id="cleanup-dialog" aria-labelledby="cleanup-title" aria-describedby="cleanup-description"><div class="dialog-body"><div class="dialog-heading"><span class="dialog-icon" data-icon="trash"></span><div><h2 id="cleanup-title">把这些内容移到废纸篓？</h2><p id="cleanup-description">请确认不再需要。移动后，可在废纸篓中找回文件。</p></div></div><div class="dialog-total"><span id="dialog-count">0 个项目</span><strong id="dialog-bytes">0 B</strong></div><div id="dialog-categories" class="dialog-categories"></div><div class="dialog-warning hidden" id="dialog-warning"><span data-icon="alert"></span><p></p></div><p class="trash-explanation">移到废纸篓不会立即释放空间。检查后，再自行清空 Finder 废纸篓。</p><div class="dialog-progress hidden" id="dialog-progress" role="status" aria-live="polite"><div class="cleanup-bar"><span id="cleanup-progress-bar"></span></div><p id="cleanup-progress-text">正在准备…</p></div></div><div class="dialog-actions"><button class="button secondary" id="dialog-cancel">保留文件</button><button class="button primary" id="dialog-confirm">移到废纸篓</button></div></dialog>
+    <dialog id="cleanup-dialog" aria-labelledby="cleanup-title" aria-describedby="cleanup-description dialog-count"><div class="dialog-body"><div class="dialog-heading"><span class="dialog-icon" data-icon="trash"></span><div><h2 id="cleanup-title">把这些内容移到废纸篓？</h2><p id="cleanup-description">请确认不再需要。移动后，可在废纸篓中找回文件。</p></div></div><div class="dialog-total"><span id="dialog-count">0 个项目</span><strong id="dialog-bytes">0 B</strong></div><div id="dialog-categories" class="dialog-categories"></div><div class="dialog-warning hidden" id="dialog-warning"><span data-icon="alert"></span><p></p></div><p class="trash-explanation">移到废纸篓不会立即释放空间。检查后，再自行清空 Finder 废纸篓。</p><div class="dialog-progress hidden" id="dialog-progress" role="status" aria-live="polite"><div class="cleanup-bar"><span id="cleanup-progress-bar"></span></div><p id="cleanup-progress-text">正在准备…</p></div></div><div class="dialog-actions"><button class="button secondary" id="dialog-cancel">保留文件</button><button class="button primary" id="dialog-confirm">移到废纸篓</button></div></dialog>
   </body>
 </html>

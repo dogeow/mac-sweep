@@ -253,6 +253,10 @@ test('permission errors, expired IDs and unknown replies preserve rows without c
     const moving = h.pending.shift();
     if (response instanceof Error) moving.reject(response); else moving.resolve(response);
     await confirming;
+    assert.equal(h.elements.get('analysis-trash-dialog').open, true);
+    assert.equal(h.elements.get('analysis-trash-confirm').disabled, true);
+    assert.equal(h.elements.get('analysis-trash-cancel').disabled, false);
+    cancel(h);
     assert.equal(await selection, false);
     assert.equal(h.isBusy(), false);
     assert.equal(h.elements.get('analysis-trash-dialog').open, false);
@@ -264,4 +268,25 @@ test('permission errors, expired IDs and unknown replies preserve rows without c
     assert.equal(trashCalls(h).length, 1);
     assert.deepEqual(Object.keys(trashCalls(h)[0].args).sort(), ['analysisId', 'nodeId']);
   }
+});
+
+test('confirmation rendering failure releases the busy state and never calls native trash', async () => {
+  const h = await loaded();
+  h.elements.get('analysis-trash-dialog').showModal = () => { throw new Error('legacy WebKit modal unsupported'); };
+  assert.equal(await h.app.trashTarget('target'), false);
+  assert.equal(h.isBusy(), false);
+  assert.equal(trashCalls(h).length, 0);
+  assert.match(h.elements.get('analysis-message').textContent, /确认窗口.*没有移动/);
+  confirm(h);
+  await h.settle();
+  assert.equal(trashCalls(h).length, 0);
+});
+
+test('symlink rows keep Finder available but cannot open a Trash confirmation', async () => {
+  const h = await loaded([targetNode({ kind: 'symlink' })]);
+  assert.equal(h.app.contextTarget('target').canTrash, false);
+  assert.match(h.app.contextTarget('target').trashReason, /Finder/);
+  assert.equal(await h.app.trashTarget('target'), false);
+  await h.app.revealTarget('target');
+  assert.equal(h.calls.at(-1).command, 'reveal_analysis_node');
 });

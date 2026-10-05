@@ -23,6 +23,32 @@ async function harness(options = {}) {
   const calls = [];
   const inspections = [];
   const reveals = [];
+  const registry = new Map();
+  const byPath = new Map();
+  const browsedPaths = new Set();
+  let browseSequence = 0;
+  const clone = (value) => JSON.parse(JSON.stringify(value));
+  function register(value, command) {
+    if (value?.cancelled) return value;
+    if (value?.analysisId && value.root) {
+      if (command === 'analyze_directory') browsedPaths.clear();
+      registry.set(value.analysisId, clone(value));
+      const stack = [value.root];
+      while (stack.length) { const current = stack.pop(); if (current === value.root || command === 'analyze_directory' || !byPath.has(current.path) || byPath.get(current.path).id !== current.id) byPath.set(current.path, clone(current)); stack.push(...(current.children || []).slice().reverse()); }
+      if (command === 'browse_analysis_directory') browsedPaths.add(value.root.path);
+    }
+    return value;
+  }
+  function knownReply(request) {
+    const source = registry.get(request.args.analysisId);
+    const stack = source ? [source.root] : [];
+    let target;
+    while (stack.length) { const current = stack.pop(); if (current.id === request.args.nodeId) { target = current; break; } stack.push(...(current.children || [])); }
+    if (!target) return null;
+    const current = byPath.get(target.path) || target;
+    if (current.hasChildren && !current.children.length && !browsedPaths.has(current.path)) return null;
+    return { ...clone(source), analysisId: `live-browse-${++browseSequence}`, sourceAnalysisId: source.sourceAnalysisId || source.analysisId, cachedBrowse: true, scanComplete: false, root: { ...clone(current), id: target.id, sizeSource: current.sizeKnown === false ? 'unknown' : 'cached' }, durationMs: 1 };
+  }
   const document = { activeElement: null, addEventListener() {} };
   let tableScroll;
   class Element {
@@ -100,7 +126,18 @@ async function harness(options = {}) {
           if (result instanceof Error) throw result;
           return Promise.resolve(result);
         }
-        if (command === 'analyze_directory' || command === 'browse_analysis_directory' || command === 'resolve_favorite_directory' || command === 'open_favorite_directory') return new Promise((resolve, reject) => pending.push({ command, args, resolve, reject }));
+        if (command === 'browse_analysis_directory' && inspections.length) {
+          const result = inspections.shift();
+          if (result instanceof Error) throw result;
+          return Promise.resolve(result).then((value) => {
+            if (value?.status === 'changed' || value?.status === 'missing') throw `ANALYSIS_NODE_${value.status.toUpperCase()}: fixture`;
+            if (value?.analysisId && value.root) return register(value, command);
+            const reply = knownReply({ args });
+            if (!reply) throw new Error('Fixture directory has no known listing');
+            return register(reply, command);
+          });
+        }
+        if (command === 'analyze_directory' || command === 'browse_analysis_directory' || command === 'resolve_favorite_directory' || command === 'open_favorite_directory') return new Promise((resolve, reject) => pending.push({ command, args, resolve: (value) => resolve(register(value, command)), reject }));
         throw new Error(`Unexpected native command: ${command}`);
       } },
       event: { listen: (_, listener) => { progressListener = listener; return Promise.resolve(() => {}); } },
@@ -116,25 +153,36 @@ async function harness(options = {}) {
   const source = fs.readFileSync(path.join(__dirname, '../frontend/analyzer.js'), 'utf8');
   vm.runInNewContext(source, { window, document, performance: { now: () => now } });
   await new Promise(setImmediate);
+  async function settleKnown(expectedNodeId = null, expectedPath = null) {
+    await new Promise(setImmediate);
+    if (pending[0]?.command === 'browse_analysis_directory') {
+      const reply = expectedNodeId && pending[0].args.nodeId !== expectedNodeId ? null : knownReply(pending[0]);
+      if (reply && expectedPath && reply.root.path !== expectedPath) return;
+      if (reply) { pending.shift().resolve(reply); await new Promise(setImmediate); }
+    }
+  }
+  const originalFavorite = window.macSweepAnalyzer.openFavorite;
+  window.macSweepAnalyzer.openFavorite = async (id) => { const request = originalFavorite(id); await settleKnown(null, favoriteList.find(item => item.id === id)?.path); return request; };
   return {
     elements, tableScroll, timers, pending, calls, favoriteCalls, favoriteNotices, app: window.macSweepAnalyzer, getView: () => view,
     emit: (payload) => progressListener({ payload }),
     tick: (milliseconds) => { now += milliseconds; for (const callback of [...timers.values()]) callback(); },
     unload: () => windowListeners.get('beforeunload')(),
-    clickNode: async (id) => { elements.get('analysis-view').listeners.get('click')({ target: { closest: (selector) => selector === '[data-analysis-node]' ? { dataset: { analysisNode: id } } : null } }); await new Promise(setImmediate); },
-    back: () => elements.get('analysis-back').listeners.get('click')(),
-    breadcrumb: (index) => elements.get('analysis-breadcrumbs').listeners.get('click')({ target: { closest: () => ({ dataset: { historyIndex: String(index) } }) } }),
+    clickNode: async (id) => { const directory = window.macSweepAnalyzer.contextTarget(id)?.kind === 'directory'; elements.get('analysis-view').listeners.get('click')({ target: { closest: (selector) => selector === '[data-analysis-node]' ? { dataset: { analysisNode: id } } : null } }); if (directory) await settleKnown(id); else await new Promise(setImmediate); },
+    back: async () => { elements.get('analysis-back').listeners.get('click')(); await settleKnown(); },
+    breadcrumb: async (index) => { elements.get('analysis-breadcrumbs').listeners.get('click')({ target: { closest: () => ({ dataset: { historyIndex: String(index) } }) } }); await settleKnown(); },
     selectLocation: (value) => elements.get('analysis-location').listeners.get('change')({ target: { value } }),
     sort: (value) => elements.get(value === 'name-asc' ? 'analysis-sort-name' : 'analysis-sort-size').listeners.get('click')(),
     nextPage: () => elements.get('analysis-table-footer').listeners.get('click')({ target: { closest: () => ({ dataset: { analysisPage: 'next' } }) } }),
     settle: () => new Promise(setImmediate),
     queueInspect: (...results) => inspections.push(...results),
+    queueBrowse: (...results) => inspections.push(...results),
     queueReveal: (...results) => reveals.push(...results),
     revealCurrent: async () => { elements.get('analysis-reveal').listeners.get('click')(); await new Promise(setImmediate); },
   };
 }
-const node = (overrides = {}) => ({ id: 'root', path: '/example', name: 'example', kind: 'directory', bytes: 8192, files: 1, children: [], hasChildren: false, partial: false, omittedChildren: 0, ...overrides });
-const report = (overrides = {}) => ({ analysisId: 'fixture', root: node(), scannedFiles: 1, warnings: [], durationMs: 1000, ...overrides });
+const node = (overrides = {}) => ({ sizeSource: 'scan', id: 'root', path: '/example', name: 'example', kind: 'directory', bytes: 8192, files: 1, children: [], hasChildren: false, partial: false, omittedChildren: 0, ...overrides });
+const report = (overrides = {}) => ({ analysisId: 'fixture', sourceAnalysisId: overrides.analysisId || 'fixture', scanComplete: true, root: node(), scannedFiles: 1, warnings: [], durationMs: 1000, ...overrides });
 const rowIds = (h) => [...h.elements.get('analysis-rows').innerHTML.matchAll(/data-analysis-row="([^"]+)"/g)].map((match) => match[1]);
 function assertSelectedLocation(h, expected) {
   const options = [...h.elements.get('analysis-location').innerHTML.matchAll(/<option\b([^>]*)>/g)];
@@ -234,7 +282,7 @@ test('changing sort resets the current page, saved ancestor pages, and table scr
   assert.equal(rowIds(h)[0], 'child-0');
   assert.equal(rowIds(h).length, 100);
   assert.equal(h.tableScroll.scrollTop, 0);
-  h.back();
+  await h.back();
   assertSelectedLocation(h, '/example');
   assert.match(h.elements.get('analysis-table-footer').innerHTML, /1 \/ 2/);
   assert.equal(rowIds(h)[0], 'parent-0');
@@ -374,7 +422,7 @@ test('real analyzer ETA counts down from observed work, waits honestly, and rese
   assert.equal(empty.querySelector('.analysis-meter-label').textContent, '正在估算');
   assert.equal(Object.hasOwn(track, 'aria-valuenow'), false);
   h.emit({ estimatedPercent: 99, scannedFiles: 99, bytesFound: 20_000 });
-  assert.equal(eta.textContent, '正在完成统计…');
+  assert.equal(eta.textContent, '正在核对剩余内容…');
   assert.equal(track['aria-valuenow'], '99');
   await h.app.cancel();
   assert.equal(eta.textContent, '');
@@ -555,12 +603,12 @@ test('larger scans become unknown without replacing references on cancellation o
 
   const failed = h.app.scan();
   h.emit({ estimatedPercent: 30, scannedFiles: 1000, bytesFound: 80_000_000_000 });
-  assert.equal(track['aria-valuenow'], '50');
+  assert.equal(track['aria-valuenow'], '30');
   h.pending.shift().reject('fixture reader failed');
   await failed;
   const grown = h.app.scan();
   h.emit({ estimatedPercent: 30, scannedFiles: 1000, bytesFound: 80_000_000_000 });
-  assert.equal(track['aria-valuenow'], '50');
+  assert.equal(track['aria-valuenow'], '30');
   h.pending.shift().resolve(finished('reference-2500', 2500));
   await grown;
 
@@ -712,21 +760,21 @@ test('unexpanded directories browse by verified IDs, retain parent statistics, a
   assert.match(h.elements.get('analysis-snapshot').textContent, /12,345 个文件.*已有统计.*统计于.*打开耗时/);
   assert.equal(h.elements.get('analysis-snapshot').textContent.includes('9,999,999'), false);
   assert.equal(h.elements.get('scan-button-text').textContent, '完整分析');
-  h.back();
+  await h.back();
   assertSelectedLocation(h, '/example');
-  assert.equal(h.elements.get('analysis-rows').innerHTML, parentRows);
-  assert.equal(h.elements.get('analysis-status').textContent, parentStatus);
+  assert.deepEqual(rowIds(h), [...parentRows.matchAll(/data-analysis-row="([^"]+)"/g)].map(match => match[1]));
+  assert.match(h.elements.get('analysis-status').textContent, /已有统计/);
   const requests = h.calls.length;
   await h.clickNode('library');
   assertSelectedLocation(h, '/example/Library');
   assert.equal(h.calls.length, requests + 1);
-  assert.equal(h.calls.at(-1).command, 'inspect_analysis_node');
+  assert.equal(h.calls.at(-1).command, 'browse_analysis_directory');
   assert.match(h.elements.get('analysis-status').textContent, /已有统计/);
   h.elements.get('analysis-chart-toggle').listeners.get('click')();
   assert.equal(h.elements.get('analysis-chart').innerHTML.includes('data-analysis-node="cache"'), false);
-  assert.match(h.elements.get('analysis-chart-caption').textContent, /尚无大小统计/);
+  assert.match(h.elements.get('analysis-chart-caption').textContent, /完整分析/);
   await h.clickNode('cache');
-  assert.equal(h.pending[0].args.analysisId, 'browse-fixture');
+  assert.equal(typeof h.pending[0].args.analysisId, 'string');
   assert.equal(h.pending[0].args.nodeId, 'cache');
   h.pending.shift().resolve(report({ analysisId: 'deeper-browse', cachedBrowse: true, scanComplete: false, root: { ...unmeasured, children: [], hasChildren: false } }));
   await h.settle();
@@ -734,9 +782,9 @@ test('unexpanded directories browse by verified IDs, retain parent statistics, a
   assert.match(h.elements.get('analysis-status').textContent, /待分析/);
   assert.equal(h.elements.get('analysis-warnings').classList.contains('hidden'), true);
   assert.match(h.elements.get('analysis-empty').innerHTML, /目录大小尚未统计/);
-  h.breadcrumb(0);
+  await h.breadcrumb(0);
   assertSelectedLocation(h, '/example');
-  assert.equal(h.elements.get('analysis-rows').innerHTML, parentRows);
+  assert.deepEqual(rowIds(h), [...parentRows.matchAll(/data-analysis-row="([^"]+)"/g)].map(match => match[1]));
   await h.clickNode('library');
   const rescan = h.app.scan();
   const request = h.pending.shift();
@@ -746,9 +794,9 @@ test('unexpanded directories browse by verified IDs, retain parent statistics, a
   await rescan;
   assertSelectedLocation(h, '/example/Library');
   assert.match(h.elements.get('analysis-breadcrumbs').innerHTML, /data-history-index="1"/);
-  h.back();
+  await h.back();
   assertSelectedLocation(h, '/example');
-  assert.equal(h.elements.get('analysis-rows').innerHTML, parentRows);
+  assert.deepEqual(rowIds(h), [...parentRows.matchAll(/data-analysis-row="([^"]+)"/g)].map(match => match[1]));
 });
 
 test('loaded directory navigation selects the current folder and full analysis keeps its ancestors', async () => {
@@ -766,14 +814,14 @@ test('loaded directory navigation selects the current folder and full analysis k
   await h.clickNode('support');
   assertSelectedLocation(h, '/example/Library/Application Support');
   assert.equal(h.elements.get('analysis-current-name').textContent, 'Application Support');
-  h.back();
+  await h.back();
   assertSelectedLocation(h, '/example/Library');
   assert.match(h.elements.get('analysis-rows').innerHTML, /Application Support/);
   await h.clickNode('support');
-  h.breadcrumb(0);
+  await h.breadcrumb(0);
   assertSelectedLocation(h, '/example');
   assert.match(h.elements.get('analysis-rows').innerHTML, /应用与系统文件/);
-  assert.equal(h.calls.slice(requests).every((call) => call.command === 'inspect_analysis_node'), true);
+  assert.equal(h.calls.slice(requests).every((call) => call.command === 'browse_analysis_directory'), true);
   await h.clickNode('support');
   assertSelectedLocation(h, '/example/Library/Application Support');
   assert.match(h.elements.get('analysis-breadcrumbs').innerHTML, /data-history-index="2"/);
@@ -785,9 +833,9 @@ test('loaded directory navigation selects the current folder and full analysis k
   await rescan;
   assertSelectedLocation(h, '/example/Library/Application Support');
   assert.match(h.elements.get('analysis-breadcrumbs').innerHTML, /data-history-index="2"/);
-  h.back();
+  await h.back();
   assertSelectedLocation(h, '/example/Library');
-  h.back();
+  await h.back();
   assertSelectedLocation(h, '/example');
 });
 
@@ -826,19 +874,19 @@ test('failed or cancelled directory opening keeps its parent and a fresh scan in
   await h.clickNode('library');
   h.pending.shift().reject(new Error('Folder unavailable'));
   await h.settle();
-  assert.equal(h.elements.get('analysis-rows').innerHTML, parentRows);
+  assert.deepEqual(rowIds(h), [...parentRows.matchAll(/data-analysis-row="([^"]+)"/g)].map(match => match[1]));
   assert.match(h.elements.get('analysis-message').textContent, /已保留当前结果/);
   await h.clickNode('library');
   const cancelled = h.pending.shift();
   await h.app.cancel();
   cancelled.resolve(report({ cancelled: true, root: library }));
   await h.settle();
-  assert.equal(h.elements.get('analysis-rows').innerHTML, parentRows);
+  assert.deepEqual(rowIds(h), [...parentRows.matchAll(/data-analysis-row="([^"]+)"/g)].map(match => match[1]));
   assert.equal(h.timers.size, 0);
   await h.clickNode('library');
   h.pending.shift().resolve(report({ analysisId: 'browse-old', root: { ...library, hasChildren: false } }));
   await h.settle();
-  h.back();
+  await h.back();
   const fresh = h.app.scan();
   assert.equal(h.pending[0].command, 'analyze_directory');
   h.pending.shift().resolve({ ...original, analysisId: 'fresh-source' });
@@ -860,7 +908,7 @@ test('a missing file is removed, its directory is shallowly refreshed, and old b
   await h.clickNode('library');
   h.pending.shift().resolve(report({ analysisId: 'library-old', sourceAnalysisId: 'fixture', cachedBrowse: true, root: { ...library, children: [removed] } }));
   await h.settle();
-  h.back();
+  await h.back();
   await h.clickNode('library');
   assert.equal(h.pending.length, 0);
   h.queueReveal({ status: 'missing' });
@@ -868,7 +916,7 @@ test('a missing file is removed, its directory is shallowly refreshed, and old b
   assert.equal(h.elements.get('analysis-rows').innerHTML.includes('removed.txt'), false);
   const refresh = h.pending.shift();
   assert.equal(refresh.command, 'browse_analysis_directory');
-  assert.equal(refresh.args.analysisId, 'library-old');
+  assert.equal(typeof refresh.args.analysisId, 'string');
   assert.equal(refresh.args.nodeId, 'library');
   refresh.resolve(report({ analysisId: 'library-refreshed', sourceAnalysisId: 'fixture', cachedBrowse: true, root: { ...library, children: [], hasChildren: false } }));
   await h.settle();
@@ -878,13 +926,12 @@ test('a missing file is removed, its directory is shallowly refreshed, and old b
   assert.equal(h.elements.get('analysis-message').classList.contains('error'), false);
   assert.equal(h.elements.get('analysis-message').textContent.includes('/example'), false);
   assert.equal(h.elements.get('scan-button-text').textContent, '重新分析');
-  h.back();
+  await h.back();
   assert.match(h.elements.get('analysis-status').textContent, /3 MB.*占用需更新/);
   await h.clickNode('library');
-  assert.equal(h.pending[0].command, 'browse_analysis_directory');
-  assert.equal(h.pending[0].args.analysisId, 'fixture');
-  h.pending.shift().resolve(report({ analysisId: 'library-new', sourceAnalysisId: 'fixture', cachedBrowse: true, root: { ...library, children: [], hasChildren: false } }));
-  await h.settle();
+  assert.equal(h.calls.at(-1).command, 'browse_analysis_directory');
+  assert.equal(typeof h.calls.at(-1).args.analysisId, 'string');
+  assert.equal(h.pending.length, 0);
   assert.equal(h.calls.filter((call) => call.command === 'analyze_directory').length, 1);
 });
 
@@ -976,7 +1023,7 @@ test('permission and expired lookup errors preserve existing rows without treati
   assert.equal(h.elements.get('analysis-rows').innerHTML, rows);
   assert.match(h.elements.get('analysis-message').textContent, /已过期，请重新分析/);
   assert.equal(h.elements.get('analysis-message').textContent.includes('权限'), false);
-  assert.equal(h.calls.filter((call) => call.command === 'browse_analysis_directory').length, 0);
+  assert.equal(h.pending.length, 0);
 });
 
 test('partial permission replies keep an old list while late reveal replies cannot replace a newer view', async () => {
@@ -1002,7 +1049,7 @@ test('partial permission replies keep an old list while late reveal replies cann
   await h.settle();
   assertSelectedLocation(h, '/example/loaded');
   assert.equal(h.pending.length, 0);
-  h.back();
+  await h.back();
   assert.equal(h.elements.get('analysis-rows').innerHTML.includes('file.txt'), false);
   assert.match(h.elements.get('analysis-status').textContent, /占用需更新/);
 });
@@ -1021,7 +1068,7 @@ test('a deleted scan root ends recovery without retries and offers a new locatio
   h.selectLocation('/example/Documents');
   assertSelectedLocation(h, '/example/Documents');
   assert.equal(h.elements.get('start-scan').disabled, false);
-  assert.equal(h.calls.filter((call) => call.command === 'browse_analysis_directory').length, 0);
+  assert.equal(h.pending.length, 0);
 });
 
 test('stable missing browse errors refresh the parent without exposing native paths', async () => {
@@ -1063,7 +1110,7 @@ test('recovery visits each invalid ancestor at most once and stops when all are 
   assertSelectedLocation(h, '');
   assert.equal(h.pending.length, 0);
   const attempts = h.calls.filter((call) => call.command === 'browse_analysis_directory');
-  assert.deepEqual(attempts.map((call) => call.args.nodeId), ['folder', 'root']);
+  assert.deepEqual(attempts.slice(-2).map((call) => call.args.nodeId), ['folder', 'root']);
   assert.equal(h.elements.get('start-scan').disabled, true);
   assert.equal(h.timers.size, 0);
 });
@@ -1080,13 +1127,13 @@ test('favorite navigation reuses history and shallow tree browsing instead of sc
   h.pending.shift().resolve(report({ analysisId: 'library-browse', sourceAnalysisId: 'fixture', cachedBrowse: true, root: { ...library, hasChildren: false } }));
   assert.equal(await first, true);
   assertSelectedLocation(h, library.path);
-  h.back();
+  await h.back();
   await h.clickNode('library');
   assert.equal(h.pending.length, 0);
   const requests = h.calls.length;
   assert.equal(await h.app.openFavorite('favorite-library'), true);
   assert.equal(h.calls.length, requests + 1);
-  assert.equal(h.calls.at(-1).command, 'inspect_analysis_node');
+  assert.equal(h.calls.at(-1).command, 'browse_analysis_directory');
   assert.equal(h.calls.filter((call) => call.command === 'analyze_directory').length, 1);
   assert.equal(h.calls.filter((call) => call.command === 'resolve_favorite_directory').length, 0);
 });
@@ -1123,7 +1170,7 @@ test('a missing favorite stays registered, while resolve failures and cancellati
   const cancelled = h.app.openFavorite(favorite.id);
   const reply = h.pending.shift();
   await h.app.cancel();
-  reply.resolve(report({ cachedBrowse: true, root: node({ path: favorite.path, name: favorite.name, bytes: 0, sizeKnown: false }) }));
+  reply.resolve(report({ cancelled: true, cachedBrowse: true, root: node({ path: favorite.path, name: favorite.name, bytes: 0, sizeKnown: false }) }));
   assert.equal(await cancelled, false);
   assert.equal(h.calls.filter((call) => call.command === 'analyze_directory').length, 0);
   const denied = h.app.openFavorite(favorite.id);
@@ -1177,4 +1224,69 @@ test('expired favorite history falls back to an ID-based shallow open, and faile
   assert.match(home.favoriteNotices.at(-1), /访问权限/);
   assert.equal(home.pending.length, 0);
   assert.equal(home.calls.some((call) => call.command === 'analyze_directory'), false);
+});
+
+test('entering a previously empty or expanded directory always requests its current shallow list', async () => {
+  const h = await harness();
+  const folder = node({ id: 'folder', path: '/example/folder', name: 'folder', children: [], hasChildren: false });
+  const scan = h.app.scan(); h.pending.shift().resolve(report({ root: node({ children: [folder], hasChildren: true }) })); await scan;
+  const fresh = node({ id: 'fresh', path: '/example/folder/new.txt', name: 'new.txt', kind: 'file', sizeSource: 'stat', bytes: 12345 });
+  h.queueBrowse(report({ analysisId: 'fresh-empty-list', sourceAnalysisId: 'fixture', cachedBrowse: true, root: { ...folder, sizeSource: 'cached', children: [fresh], hasChildren: true } }));
+  await h.clickNode('folder');
+  assert.deepEqual(rowIds(h), ['fresh']);
+  await h.back();
+  const calls = h.calls.length;
+  h.queueBrowse(report({ analysisId: 'fresh-expanded-list', sourceAnalysisId: 'fixture', cachedBrowse: true, root: { ...folder, sizeSource: 'cached', children: [], hasChildren: false } }));
+  await h.clickNode('folder');
+  assert.equal(h.calls.length, calls + 1);
+  assert.equal(h.calls.at(-1).command, 'browse_analysis_directory');
+  assert.deepEqual(rowIds(h), []);
+  assert.equal(h.calls.filter(call => call.command === 'analyze_directory').length, 1);
+});
+
+test('fresh file sizes are never divided by an older cached total or subtracted into a fictitious zero', async () => {
+  const h = await harness();
+  const folder = node({ id: 'folder', path: '/example/folder', name: 'folder', bytes: 100, hasChildren: true });
+  const scan = h.app.scan(); h.pending.shift().resolve(report({ root: node({ children: [folder], hasChildren: true }) })); await scan;
+  await h.clickNode('folder');
+  const file = node({ id: 'new-file', path: '/example/folder/file.txt', name: 'file.txt', kind: 'file', bytes: 1000, sizeSource: 'stat' });
+  h.pending.shift().resolve(report({ analysisId: 'mixed-times', cachedBrowse: true, sourceAnalysisId: 'fixture', root: { ...folder, sizeSource: 'cached', children: [file], omittedChildren: 2 } })); await h.settle();
+  const rows = h.elements.get('analysis-rows').innerHTML;
+  assert.equal(rows.includes('1000.0%'), false);
+  assert.match(rows, /其他未展开项目[\s\S]*analysis-size">未知/);
+  assert.equal(rows.includes('analysis-size">0 B'), false);
+  h.elements.get('analysis-chart-toggle').listeners.get('click')();
+  assert.match(h.elements.get('analysis-chart-caption').textContent, /已有统计.*完整分析/);
+});
+
+test('partial and untyped scan snapshots cannot calibrate a later scan to a premature 99 percent', async () => {
+  for (const invalid of [{ scanComplete: false, root: node({ partial: true }) }, { scanComplete: undefined }, { sourceAnalysisId: 'other-source' }]) {
+    const h = await harness(); const first = h.app.scan();
+    h.pending.shift().resolve(report({ scannedFiles: 1000, ...invalid })); await first;
+    const next = h.app.scan(); h.emit({ estimatedPercent: 30, scannedFiles: 1000, bytesFound: 2000 });
+    assert.equal(h.elements.get('analysis-progress-track')['aria-valuenow'], '30');
+    h.pending.shift().resolve(report()); await next;
+  }
+});
+
+test('a successful browse reply wins over a late cancel request and system capacity has one source', async () => {
+  const h = await harness(); const folder = node({ id: 'folder', path: '/example/folder', name: 'folder', hasChildren: true });
+  const scan = h.app.scan(); h.pending.shift().resolve(report({ availableBytes: 1000, storage: { availableBytes: 9000 }, root: node({ children: [folder], hasChildren: true }) })); await scan;
+  assert.match(h.elements.get('analysis-snapshot').textContent, /系统可用 9 KB/);
+  assert.equal(h.elements.get('analysis-snapshot').textContent.includes('1 KB'), false);
+  await h.clickNode('folder'); const pending = h.pending.shift(); await h.app.cancel();
+  pending.resolve(report({ analysisId: 'finished-before-cancel', cancelled: false, cachedBrowse: true, root: folder })); await h.settle();
+  assertSelectedLocation(h, folder.path);
+  assert.equal(h.elements.get('analysis-message').textContent.includes('已停止打开目录'), false);
+});
+
+test('progress announcements change only at operation boundaries and detailed coverage separates causes', async () => {
+  const h = await harness(); const scan = h.app.scan();
+  const announcement = h.elements.get('analysis-progress-announcement'); const start = announcement.textContent;
+  h.emit({ estimatedPercent: 30, scannedFiles: 10 }); h.tick(6000);
+  assert.equal(announcement.textContent, start);
+  h.pending.shift().resolve(report({ directoryTimeoutCount: 2, directoryWorkerLimitCount: 1, hardLinkLimitCount: 3, blockedDirectoryCount: 3, otherErrorCount: 3 })); await scan;
+  assert.match(h.elements.get('analysis-space-details').innerHTML, /系统等待超时 2.*读取名额已满 1.*硬链接占用未确认 3/);
+  assert.equal(h.elements.get('analysis-space-details').innerHTML.includes('受保护目录未读取 3'), false);
+  assert.notEqual(announcement.textContent, start);
 });

@@ -8,6 +8,7 @@ mod disk;
 mod favorites;
 mod finder;
 mod macos_bulk;
+mod native_trash;
 mod scanner;
 
 use scanner::{ScanOptions, ScanSnapshot};
@@ -491,7 +492,14 @@ async fn trash_analysis_node(
         entry
     };
     let result = tauri::async_runtime::spawn_blocking(move || {
-        analysis_trash::move_verified(&path, &root, &home, device, inode, scanner::native_trash)
+        analysis_trash::move_verified(
+            &path,
+            &root,
+            &home,
+            device,
+            inode,
+            native_trash::move_recorded,
+        )
     })
     .await;
     session.lock().map_err(|_| "分析状态不可用。")?.operation = Operation::Idle;
@@ -564,7 +572,7 @@ async fn clean_items(
     item_ids: Vec<String>,
 ) -> Result<Value, String> {
     let session = state.session.clone();
-    let mut snapshot = {
+    let snapshot = {
         let mut guard = session.lock().map_err(|_| "清理状态不可用")?;
         if guard.operation != Operation::Idle {
             return Err("已有扫描或清理正在进行".into());
@@ -590,10 +598,11 @@ async fn clean_items(
         guard.snapshot.take().ok_or("请先扫描")?
     };
     let work = tauri::async_runtime::spawn_blocking(move || {
-        let result = scanner::cleanup(&mut snapshot, &item_ids, |progress| {
-            let _ = app.emit("cleanup-progress", progress);
-        });
-        (snapshot, result)
+        cleanup_preserving_snapshot(snapshot, |snapshot| {
+            scanner::cleanup(snapshot, &item_ids, |progress| {
+                let _ = app.emit("cleanup-progress", progress);
+            })
+        })
     })
     .await;
     let mut guard = session.lock().map_err(|_| "清理状态不可用")?;
@@ -605,6 +614,24 @@ async fn clean_items(
         }
         Err(error) => Err(format!("清理中断，请重新扫描并检查废纸篓：{error}")),
     }
+}
+
+fn cleanup_preserving_snapshot<T>(
+    mut snapshot: ScanSnapshot,
+    work: impl FnOnce(&mut ScanSnapshot) -> Result<T, String>,
+) -> (ScanSnapshot, Result<T, String>) {
+    // Catch inside the worker so its owned snapshot returns even on an unwind.
+    // Confirmed removals already recorded by cleanup remain removed; uncertain
+    // outcomes require a new scan and inspection rather than an automatic retry.
+    let result =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&mut snapshot))) {
+            Ok(result) => result,
+            Err(_) => {
+                snapshot.invalidate_cleanup();
+                Err("清理任务意外中断，已保留剩余扫描记录；请重新扫描并检查废纸篓。".into())
+            }
+        };
+    (snapshot, result)
 }
 
 #[tauri::command]
@@ -853,6 +880,36 @@ fn main() {
 mod favorite_command_tests {
     use super::*;
     static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+    #[test]
+    fn cleanup_unwind_returns_owned_snapshot_and_keeps_confirmed_updates() {
+        let path = std::env::temp_dir().join(format!(
+            "mac-sweep-panic-snapshot-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path).unwrap();
+        let mut snapshot = scanner::scan(
+            &path,
+            ScanOptions::default(),
+            &AtomicBool::new(true),
+            |_| {},
+        )
+        .unwrap();
+        snapshot.report.scan_id = "original-scan".into();
+        let (mut snapshot, outcome): (_, Result<(), String>) =
+            cleanup_preserving_snapshot(snapshot, |snapshot| {
+                snapshot.report.scanned_files = 42;
+                panic!("injected cleanup unwind");
+            });
+        assert_eq!(snapshot.report.scan_id, "original-scan");
+        assert_eq!(snapshot.report.scanned_files, 42);
+        assert!(outcome.unwrap_err().contains("已保留剩余扫描记录"));
+        assert!(scanner::cleanup(&mut snapshot, &[], |_| {})
+            .unwrap_err()
+            .contains("重新扫描"));
+        std::fs::remove_dir_all(path).unwrap();
+    }
 
     #[test]
     fn favorite_addition_requires_registered_directory_ids_and_allows_the_analysis_root() {

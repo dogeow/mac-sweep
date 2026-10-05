@@ -1,4 +1,14 @@
 fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        cc::Build::new()
+            .file("src/native_trash.m")
+            .flag("-fobjc-arc")
+            .flag("-Wno-deprecated-declarations")
+            .compile("mac_sweep_native_trash");
+        println!("cargo:rustc-link-lib=framework=Foundation");
+        println!("cargo:rustc-link-lib=framework=CoreServices");
+        println!("cargo:rerun-if-changed=src/native_trash.m");
+    }
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "start_scan",

@@ -22,14 +22,14 @@ const DISPLAY_CHILDREN: usize = 300;
 const DISPLAY_NODES: u64 = 15_000;
 const DIRECTORY_SUMMARIES: usize = 20_000;
 const MAX_DEPTH: usize = 256;
-const ROOT_PREFETCH_ENTRIES: usize = 100_000;
 const DEEP_PROGRESS_ENTRIES: usize = 1_024;
+const HARD_LINK_IDENTITIES: usize = 100_000;
 // macOS SDK sys/stat.h: SF_DATALESS marks a File Provider object whose content
 // is online. Enumerating an online directory/package can trigger hydration.
 const SF_DATALESS: u32 = 0x4000_0000;
 const PROTECTED_DIRECTORY_TIMEOUT: Duration = Duration::from_secs(10);
 const DIRECTORY_WAIT_POLL: Duration = Duration::from_millis(100);
-const PROTECTED_DIRECTORY_ENTRY_LIMIT: usize = 100_000;
+const PROTECTED_DIRECTORY_BATCH_ENTRIES: usize = 256;
 const MAX_DIRECTORY_WORKERS: usize = 4;
 static ACTIVE_DIRECTORY_WORKERS: AtomicUsize = AtomicUsize::new(0);
 static DIRECTORY_POOL: OnceLock<Result<DirectoryWorkerPool, String>> = OnceLock::new();
@@ -79,6 +79,10 @@ pub struct AnalysisReport {
     pub cloud_placeholder_count: u64,
     /// Protected personal/app directories left unread after OS timeouts or exhausted slots.
     pub blocked_directory_count: u64,
+    pub directory_timeout_count: u64,
+    pub directory_worker_limit_count: u64,
+    /// Multiply-linked file visits whose allocation is unknown after the identity cap.
+    pub hard_link_limit_count: u64,
     pub cached_browse: bool,
     pub source_analysis_id: String,
     /// Source full analysis completion time, in Unix milliseconds.
@@ -217,6 +221,11 @@ fn directory_failure<F: Fn(AnalysisProgress)>(
         DirectoryReadFailure::TimedOut | DirectoryReadFailure::WorkerLimit => {
             ctx.blocked_directory_count += 1;
             ctx.other_error_count += 1;
+            if matches!(failure, DirectoryReadFailure::TimedOut) {
+                ctx.directory_timeout_count += 1;
+            } else {
+                ctx.directory_worker_limit_count += 1;
+            }
             let reason = if matches!(failure, DirectoryReadFailure::TimedOut) {
                 "系统未及时返回目录内容"
             } else {
@@ -326,6 +335,7 @@ pub fn browse(
     let mut root = selected.shallow_clone();
     if root.size_known {
         root.size_source = "cached".into();
+        ctx.warn("目录大小来自此前分析；这次只刷新直属项目，没有重新计算目录总量。".into());
     }
     let mut rows = BinaryHeap::new();
     let mut direct_count = 0_u64;
@@ -350,11 +360,7 @@ pub fn browse(
                     ctx.warn("实时目录未读到，仅显示已有统计中的子目录，列表可能有遗漏。".into());
                 }
             }
-            Ok((mut entries, truncated)) => {
-                listing_partial |= truncated;
-                if truncated {
-                    ctx.warn("直属项目达到显示读取上限，部分项目没有列出。".into());
-                }
+            Ok(mut entries) => {
                 loop {
                     if !ctx.check() {
                         listing_partial = true;
@@ -373,6 +379,35 @@ pub fn browse(
                             continue;
                         }
                     };
+                    #[cfg(target_os = "macos")]
+                    if let Some(metadata) = entry.bulk_file_metadata() {
+                        let own = ctx.record_bulk_file(metadata);
+                        rows.push(Displayed {
+                            node: DirectoryNode {
+                                id: format!("{analysis_id}-{direct_count}"),
+                                path: entry.path().to_str().unwrap_or_default().to_owned(),
+                                name: entry.file_name().to_string_lossy().into_owned(),
+                                kind: "file".into(),
+                                bytes: own.bytes,
+                                files: 1,
+                                dirs: 0,
+                                children: Vec::new(),
+                                has_children: false,
+                                partial: own.partial,
+                                omitted_children: 0,
+                                size_known: !own.partial,
+                                size_source: if own.partial { "unknown" } else { "stat" }.into(),
+                                device: metadata.device,
+                                inode: metadata.inode,
+                            },
+                            nodes: 1,
+                        });
+                        listing_partial |= own.partial;
+                        if rows.len() > DISPLAY_CHILDREN {
+                            rows.pop();
+                        }
+                        continue;
+                    }
                     let metadata = match entry.metadata() {
                         Ok(metadata) => metadata,
                         Err(error) => {
@@ -409,10 +444,15 @@ pub fn browse(
                         dirs: own.dirs,
                         children: Vec::new(),
                         has_children: directory && !cloud && metadata.dev() == index.device,
-                        partial: directory,
+                        partial: directory || own.partial,
                         omitted_children: 0,
-                        size_known: !directory,
-                        size_source: if directory { "unknown" } else { "stat" }.into(),
+                        size_known: !directory && !own.partial,
+                        size_source: if directory || own.partial {
+                            "unknown"
+                        } else {
+                            "stat"
+                        }
+                        .into(),
                         device: metadata.dev(),
                         inode: metadata.ino(),
                     };
@@ -430,7 +470,9 @@ pub fn browse(
                             "unknown"
                         }
                         .into();
-                        child.has_children = cached.has_children && !cloud;
+                        // A previously empty directory may now contain files.
+                        // Only a current shallow listing may declare it empty.
+                        child.has_children = !cloud && metadata.dev() == index.device;
                     }
                     if directory && metadata.dev() != index.device {
                         ctx.skipped_mount_count += 1;
@@ -449,7 +491,9 @@ pub fn browse(
                     if rows.len() > DISPLAY_CHILDREN {
                         rows.pop();
                     }
+                    listing_partial |= own.partial;
                 }
+                listing_partial |= !ctx.check();
             }
         }
     }
@@ -463,6 +507,7 @@ pub fn browse(
     });
     root.omitted_children = direct_count.saturating_sub(children.len() as u64);
     root.children = children.into_iter().map(|row| row.node).collect();
+    root.has_children = direct_count > 0 || listing_partial;
     root.partial |= listing_partial;
     let cancelled = cancel.load(Ordering::Relaxed);
     Ok(AnalysisReport {
@@ -482,6 +527,9 @@ pub fn browse(
         depth_limited_count: 0,
         cloud_placeholder_count: ctx.cloud_placeholder_count,
         blocked_directory_count: ctx.blocked_directory_count,
+        directory_timeout_count: ctx.directory_timeout_count,
+        directory_worker_limit_count: ctx.directory_worker_limit_count,
+        hard_link_limit_count: ctx.hard_link_limit_count,
         cached_browse: true,
         source_analysis_id: index.source_analysis_id.clone(),
         measured_at: index.measured_at,
@@ -551,6 +599,8 @@ struct Context<'a, F: Fn(AnalysisProgress)> {
     warnings: Vec<String>,
     /// Only multiply-linked files need an inode set; ordinary files use no entry.
     hard_links: HashSet<(u64, u64)>,
+    hard_link_capacity: usize,
+    hard_link_limit_count: u64,
     permission_denied_count: u64,
     other_error_count: u64,
     skipped_mount_count: u64,
@@ -558,6 +608,8 @@ struct Context<'a, F: Fn(AnalysisProgress)> {
     depth_limited_count: u64,
     cloud_placeholder_count: u64,
     blocked_directory_count: u64,
+    directory_timeout_count: u64,
+    directory_worker_limit_count: u64,
     summaries: BoundedDirectorySummaries,
     work_budget: f64,
     work_credit: f64,
@@ -584,6 +636,8 @@ impl<F: Fn(AnalysisProgress)> Context<'_, F> {
             stopped: false,
             warnings: Vec::new(),
             hard_links: HashSet::new(),
+            hard_link_capacity: HARD_LINK_IDENTITIES,
+            hard_link_limit_count: 0,
             permission_denied_count: 0,
             other_error_count: 0,
             skipped_mount_count: 0,
@@ -591,6 +645,8 @@ impl<F: Fn(AnalysisProgress)> Context<'_, F> {
             depth_limited_count: 0,
             cloud_placeholder_count: 0,
             blocked_directory_count: 0,
+            directory_timeout_count: 0,
+            directory_worker_limit_count: 0,
             summaries: BoundedDirectorySummaries::new(DIRECTORY_SUMMARIES),
             work_budget: 1.0,
             work_credit: 0.0,
@@ -659,6 +715,13 @@ impl<F: Fn(AnalysisProgress)> Context<'_, F> {
     }
 
     fn record_error(&mut self, error: &io::Error) {
+        if error.kind() == io::ErrorKind::TimedOut {
+            self.blocked_directory_count = self.blocked_directory_count.saturating_add(1);
+            self.directory_timeout_count = self.directory_timeout_count.saturating_add(1);
+        } else if error.kind() == io::ErrorKind::WouldBlock {
+            self.blocked_directory_count = self.blocked_directory_count.saturating_add(1);
+            self.directory_worker_limit_count = self.directory_worker_limit_count.saturating_add(1);
+        }
         if error.kind() == io::ErrorKind::PermissionDenied
             || matches!(error.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES))
         {
@@ -668,28 +731,49 @@ impl<F: Fn(AnalysisProgress)> Context<'_, F> {
         }
     }
 
+    /// None means this new identity cannot be retained. Exclude its allocation
+    /// rather than counting an untracked hard link again later in the walk.
+    fn hard_link_duplicate(&mut self, device: u64, inode: u64, links: u64) -> Option<bool> {
+        if links <= 1 {
+            return Some(false);
+        }
+        let identity = (device, inode);
+        if self.hard_links.contains(&identity) {
+            return Some(true);
+        }
+        if self.hard_links.len() >= self.hard_link_capacity {
+            self.hard_link_limit_count = self.hard_link_limit_count.saturating_add(1);
+            self.warn("硬链接去重记录达到内存上限；后续无法记录的新硬链接占用未知，已知占用仅为下界。文件仍继续遍历。".into());
+            return None;
+        }
+        self.hard_links.insert(identity);
+        Some(false)
+    }
+
     fn record_metadata(&mut self, metadata: &fs::Metadata, cloud_placeholder: bool) -> Totals {
         let directory = metadata.is_dir();
         let file = metadata.is_file();
         let cross_device = directory && metadata.dev() != self.device;
         // APFS clones have different inodes. Only real hard links can be safely
         // deduplicated using stat; shared/cloned extents remain separately measured.
-        let duplicate_link = file
-            && metadata.nlink() > 1
-            && !self.hard_links.insert((metadata.dev(), metadata.ino()));
+        let duplicate_link = if file {
+            self.hard_link_duplicate(metadata.dev(), metadata.ino(), metadata.nlink())
+        } else {
+            Some(false)
+        };
         if cloud_placeholder {
             self.cloud_placeholder_count = self.cloud_placeholder_count.saturating_add(1);
             self.warn("在线云盘占位内容未下载，未计入本地文件占用；只统计已有的本地数据。".into());
         }
         let totals = Totals {
-            bytes: if cross_device || duplicate_link {
+            bytes: if cross_device || duplicate_link != Some(false) {
                 0
             } else {
                 metadata.blocks().saturating_mul(512)
             },
             files: u64::from(file),
             dirs: u64::from(directory),
-            partial: cross_device || (directory && cloud_placeholder),
+            partial: cross_device || (directory && cloud_placeholder) || duplicate_link.is_none(),
             children: 0,
         };
         self.files = self.files.saturating_add(totals.files);
@@ -699,19 +783,23 @@ impl<F: Fn(AnalysisProgress)> Context<'_, F> {
 
     #[cfg(target_os = "macos")]
     fn record_bulk_file(&mut self, metadata: crate::macos_bulk::FileMetadata) -> Totals {
-        let duplicate =
-            metadata.link_count > 1 && !self.hard_links.insert((metadata.device, metadata.inode));
+        let duplicate = self.hard_link_duplicate(
+            metadata.device,
+            metadata.inode,
+            u64::from(metadata.link_count),
+        );
         if flags_are_cloud_placeholder(metadata.flags) {
             self.cloud_placeholder_count += 1;
             self.warn("在线云盘占位内容未下载，未计入本地文件占用；只统计已有的本地数据。".into());
         }
         let totals = Totals {
-            bytes: if duplicate {
+            bytes: if duplicate != Some(false) {
                 0
             } else {
                 metadata.allocated_bytes
             },
             files: 1,
+            partial: duplicate.is_none(),
             ..Totals::default()
         };
         self.files = self.files.saturating_add(1);
@@ -869,6 +957,9 @@ fn run_directory_worker<T: Send + 'static>(
             return;
         }
         let result = operation(worker_stop);
+        // Release capacity before publishing the batch: processing its children
+        // must never compete with a completed ancestor's worker reservation.
+        drop(_slot);
         // A dropped receiver frees buffered entries when a delayed OS call
         // finally returns; no scan context or report is held by this thread.
         let _ = sender.send(result);
@@ -948,6 +1039,13 @@ impl From<fs::DirEntry> for AnalysisEntry {
 }
 
 impl AnalysisEntry {
+    #[cfg(target_os = "macos")]
+    fn bulk_file_metadata(&self) -> Option<crate::macos_bulk::FileMetadata> {
+        match self {
+            Self::Bulk { entry, .. } => entry.metadata,
+            Self::Standard(_) => None,
+        }
+    }
     fn path(&self) -> PathBuf {
         match self {
             Self::Standard(entry) => entry.path(),
@@ -987,9 +1085,109 @@ impl AnalysisEntry {
     }
 }
 
-struct BufferedDirectory {
+enum DirectoryCancellation<'a> {
+    Borrowed(&'a AtomicBool),
+    Shared(Arc<AtomicBool>),
+}
+
+impl DirectoryCancellation<'_> {
+    fn flag(&self) -> &AtomicBool {
+        match self {
+            Self::Borrowed(flag) => flag,
+            Self::Shared(flag) => flag,
+        }
+    }
+}
+
+struct ProtectedDirectory<'a> {
+    path: PathBuf,
+    reader: Option<Box<DirectoryEntries<'static>>>,
+    pending: std::vec::IntoIter<io::Result<AnalysisEntry>>,
+    cancel: &'a AtomicBool,
+    exhausted: bool,
+}
+
+struct ProtectedBatch {
+    reader: Box<DirectoryEntries<'static>>,
     entries: Vec<io::Result<AnalysisEntry>>,
-    truncated: bool,
+    exhausted: bool,
+}
+
+impl ProtectedDirectory<'_> {
+    fn refill(&mut self) -> Result<(), DirectoryReadFailure> {
+        let reader = self.reader.take();
+        let path = self.path.clone();
+        let batch = run_directory_worker(self.cancel, PROTECTED_DIRECTORY_TIMEOUT, move |stop| {
+            let mut reader = match reader {
+                Some(mut reader) => {
+                    #[cfg(target_os = "macos")]
+                    if let DirectoryEntries::Bulk { cancel, .. } = reader.as_mut() {
+                        *cancel = DirectoryCancellation::Shared(Arc::clone(&stop));
+                    }
+                    reader
+                }
+                None => Box::new(open_directory_entries_with_cancel(
+                    &path,
+                    DirectoryCancellation::Shared(Arc::clone(&stop)),
+                )?),
+            };
+            let mut entries = Vec::with_capacity(PROTECTED_DIRECTORY_BATCH_ENTRIES);
+            while entries.len() < PROTECTED_DIRECTORY_BATCH_ENTRIES {
+                if stop.load(Ordering::Relaxed) {
+                    return Err(io::Error::from(io::ErrorKind::Interrupted));
+                }
+                let Some(entry) = reader.next() else {
+                    return Ok(ProtectedBatch {
+                        reader,
+                        entries,
+                        exhausted: true,
+                    });
+                };
+                entries.push(entry);
+            }
+            Ok(ProtectedBatch {
+                reader,
+                entries,
+                exhausted: false,
+            })
+        })?;
+        self.reader = Some(batch.reader);
+        self.pending = batch.entries.into_iter();
+        self.exhausted = batch.exhausted;
+        Ok(())
+    }
+
+    fn next(&mut self) -> Option<io::Result<AnalysisEntry>> {
+        if self.cancel.load(Ordering::Relaxed) {
+            self.exhausted = true;
+            return None;
+        }
+        if let Some(entry) = self.pending.next() {
+            return Some(entry);
+        }
+        if self.exhausted {
+            return None;
+        }
+        match self.refill() {
+            Ok(()) => self.pending.next(),
+            Err(failure) => {
+                self.exhausted = true;
+                let error = match failure {
+                    DirectoryReadFailure::Io(error) => error,
+                    DirectoryReadFailure::TimedOut => io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "系统未及时返回目录内容；剩余占用未知。",
+                    ),
+                    DirectoryReadFailure::WorkerLimit => io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "等待线程达到限额；剩余目录未读取，占用未知。",
+                    ),
+                    DirectoryReadFailure::Cancelled => io::Error::from(io::ErrorKind::Interrupted),
+                };
+                Some(Err(error))
+            }
+        }
+    }
 }
 
 enum DirectoryEntries<'a> {
@@ -999,12 +1197,13 @@ enum DirectoryEntries<'a> {
         std::vec::IntoIter<io::Result<AnalysisEntry>>,
         Box<DirectoryEntries<'a>>,
     ),
+    Protected(Box<ProtectedDirectory<'a>>),
     #[cfg(target_os = "macos")]
     Bulk {
         directory: crate::macos_bulk::BulkDirectory,
         parent: Arc<PathBuf>,
         pending: std::vec::IntoIter<io::Result<crate::macos_bulk::BulkEntry>>,
-        cancel: &'a AtomicBool,
+        cancel: DirectoryCancellation<'a>,
     },
     Done(std::marker::PhantomData<&'a AtomicBool>),
 }
@@ -1026,6 +1225,7 @@ impl Iterator for DirectoryEntries<'_> {
                 Self::Prefetched(entries, remaining) => {
                     return entries.next().or_else(|| remaining.next())
                 }
+                Self::Protected(entries) => return entries.next(),
                 #[cfg(target_os = "macos")]
                 Self::Bulk {
                     directory,
@@ -1039,7 +1239,7 @@ impl Iterator for DirectoryEntries<'_> {
                             entry,
                         }));
                     }
-                    match directory.next_batch(cancel) {
+                    match directory.next_batch(cancel.flag()) {
                         Ok(Some(batch)) => {
                             *pending = batch.into_iter();
                         }
@@ -1073,17 +1273,12 @@ impl Iterator for DirectoryEntries<'_> {
 }
 
 impl DirectoryEntries<'_> {
-    fn prepare_progress(self, depth: usize, cancel: &AtomicBool) -> Self {
-        let limit = if depth <= 2 {
-            ROOT_PREFETCH_ENTRIES
-        } else {
-            DEEP_PROGRESS_ENTRIES
-        };
-        self.prepare_progress_with_limit(cancel, limit)
+    fn prepare_progress(self, _depth: usize, cancel: &AtomicBool) -> Self {
+        self.prepare_progress_with_limit(cancel, DEEP_PROGRESS_ENTRIES)
     }
 
     fn prepare_progress_with_limit(self, cancel: &AtomicBool, limit: usize) -> Self {
-        if matches!(self, Self::Buffered(_)) {
+        if matches!(self, Self::Buffered(_) | Self::Protected(_)) {
             return self;
         }
         let mut remaining = self;
@@ -1123,6 +1318,13 @@ fn open_directory_entries<'a>(
     path: &Path,
     cancel: &'a AtomicBool,
 ) -> io::Result<DirectoryEntries<'a>> {
+    open_directory_entries_with_cancel(path, DirectoryCancellation::Borrowed(cancel))
+}
+
+fn open_directory_entries_with_cancel<'a>(
+    path: &Path,
+    cancel: DirectoryCancellation<'a>,
+) -> io::Result<DirectoryEntries<'a>> {
     #[cfg(target_os = "macos")]
     {
         match crate::macos_bulk::BulkDirectory::open(path) {
@@ -1146,43 +1348,21 @@ fn open_directory_entries<'a>(
 fn directory_entries<'a>(
     path: &Path,
     cancel: &'a AtomicBool,
-) -> Result<(DirectoryEntries<'a>, bool), DirectoryReadFailure> {
+) -> Result<DirectoryEntries<'a>, DirectoryReadFailure> {
     if !requires_bounded_enumeration(path) {
-        return open_directory_entries(path, cancel)
-            .map(|entries| (entries, false))
-            .map_err(DirectoryReadFailure::Io);
+        return open_directory_entries(path, cancel).map_err(DirectoryReadFailure::Io);
     }
-    let path = path.to_path_buf();
-    let buffered = run_directory_worker(cancel, PROTECTED_DIRECTORY_TIMEOUT, move |stop| {
-        if stop.load(Ordering::Relaxed) {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "目录检查已停止。",
-            ));
-        }
-        let mut reader = open_directory_entries(&path, &stop)?;
-        let mut entries = Vec::new();
-        while entries.len() < PROTECTED_DIRECTORY_ENTRY_LIMIT && !stop.load(Ordering::Relaxed) {
-            let Some(entry) = reader.next() else {
-                return Ok(BufferedDirectory {
-                    entries,
-                    truncated: false,
-                });
-            };
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
-            entries.push(entry);
-        }
-        Ok(BufferedDirectory {
-            truncated: entries.len() >= PROTECTED_DIRECTORY_ENTRY_LIMIT,
-            entries,
-        })
-    })?;
-    Ok((
-        DirectoryEntries::Buffered(buffered.entries.into_iter()),
-        buffered.truncated,
-    ))
+    let mut entries = ProtectedDirectory {
+        path: path.to_path_buf(),
+        reader: None,
+        pending: Vec::new().into_iter(),
+        cancel,
+        exhausted: false,
+    };
+    // Return at most one batch before counting starts. No worker remains busy
+    // while the walker processes these entries or recurses into a child.
+    entries.refill()?;
+    Ok(DirectoryEntries::Protected(Box::new(entries)))
 }
 
 fn empty_partial() -> Measured {
@@ -1233,7 +1413,9 @@ fn measure_entry<F: Fn(AnalysisProgress)>(
         if let Some(metadata) = bulk.metadata {
             ctx.visits = ctx.visits.saturating_add(1);
             let totals = ctx.record_bulk_file(metadata);
-            ctx.complete_work(ctx.work_budget);
+            if !totals.partial {
+                ctx.complete_work(ctx.work_budget);
+            }
             if ctx.progress_due() {
                 ctx.emit(&entry.path());
             }
@@ -1252,10 +1434,10 @@ fn measure_entry<F: Fn(AnalysisProgress)>(
                         dirs: 0,
                         children: Vec::new(),
                         has_children: false,
-                        partial: false,
+                        partial: totals.partial,
                         omitted_children: 0,
-                        size_known: true,
-                        size_source: "scan".into(),
+                        size_known: !totals.partial,
+                        size_source: if totals.partial { "unknown" } else { "scan" }.into(),
                         device: metadata.device,
                         inode: metadata.inode,
                     },
@@ -1285,7 +1467,9 @@ fn measure_entry<F: Fn(AnalysisProgress)>(
         // node, identifier, name, heap item, or path string in memory.
         ctx.visits = ctx.visits.saturating_add(1);
         let totals = ctx.record_metadata(&metadata, is_cloud_placeholder(&metadata));
-        ctx.complete_work(ctx.work_budget);
+        if !totals.partial {
+            ctx.complete_work(ctx.work_budget);
+        }
         if ctx.progress_due() {
             ctx.emit(&entry.path());
         }
@@ -1371,6 +1555,12 @@ fn measure_metadata_with_policy<F: Fn(AnalysisProgress)>(
                 // because earlier timed-out workers still occupy all slots.
                 ctx.blocked_directory_count = ctx.blocked_directory_count.saturating_add(1);
                 ctx.other_error_count = ctx.other_error_count.saturating_add(1);
+                if matches!(failure, DirectoryReadFailure::TimedOut) {
+                    ctx.directory_timeout_count = ctx.directory_timeout_count.saturating_add(1);
+                } else {
+                    ctx.directory_worker_limit_count =
+                        ctx.directory_worker_limit_count.saturating_add(1);
+                }
                 let warning = if matches!(failure, DirectoryReadFailure::TimedOut) {
                     format!(
                         "系统未及时返回 {} 的目录内容，已跳过。可以检查完整磁盘访问权限后重扫；此处占用未知。",
@@ -1388,7 +1578,7 @@ fn measure_metadata_with_policy<F: Fn(AnalysisProgress)>(
                 totals.partial = true;
                 ctx.stopped = true;
             }
-            Ok((entries, truncated)) => {
+            Ok(entries) => {
                 let mut entries = entries.prepare_progress(depth, ctx.cancel);
                 let weights = entries.progress_weights(depth);
                 let total_weight = weights
@@ -1396,7 +1586,7 @@ fn measure_metadata_with_policy<F: Fn(AnalysisProgress)>(
                     .map(|weights| weights.iter().sum::<f64>())
                     .unwrap_or(0.0);
                 if depth == 0 {
-                    ctx.estimate_ready = weights.is_some() && !truncated;
+                    ctx.estimate_ready = weights.is_some();
                 }
                 let unknown_stream = weights.is_none();
                 if unknown_stream {
@@ -1408,15 +1598,6 @@ fn measure_metadata_with_policy<F: Fn(AnalysisProgress)>(
                 // than shrinking every descendant's budget at every depth.
                 let child_budget = work_budget * if depth == 0 { 0.9 } else { 1.0 };
                 let mut completed_entries = 0_u64;
-                if truncated {
-                    totals.partial = true;
-                    ctx.other_error_count = ctx.other_error_count.saturating_add(1);
-                    ctx.warn(format!(
-                        "{} 的受保护目录项目超过 {} 项，未列出的内容占用未知。",
-                        path.display(),
-                        PROTECTED_DIRECTORY_ENTRY_LIMIT
-                    ));
-                }
                 loop {
                     if !ctx.check() {
                         totals.partial = true;
@@ -1471,6 +1652,7 @@ fn measure_metadata_with_policy<F: Fn(AnalysisProgress)>(
                 if unknown_stream {
                     ctx.unknown_work_streams -= 1;
                 }
+                totals.partial |= !ctx.check();
             }
         }
         // The walk is not a filesystem snapshot; flag directories changing while measured.
@@ -1563,7 +1745,7 @@ fn measure_metadata_with_policy<F: Fn(AnalysisProgress)>(
                 partial: totals.partial,
                 omitted_children,
                 size_known,
-                size_source: "scan".into(),
+                size_source: if size_known { "scan" } else { "unknown" }.into(),
                 device: metadata.dev(),
                 inode: metadata.ino(),
             },
@@ -1682,6 +1864,9 @@ pub fn analyze(
         depth_limited_count: ctx.depth_limited_count,
         cloud_placeholder_count: ctx.cloud_placeholder_count,
         blocked_directory_count: ctx.blocked_directory_count,
+        directory_timeout_count: ctx.directory_timeout_count,
+        directory_worker_limit_count: ctx.directory_worker_limit_count,
+        hard_link_limit_count: ctx.hard_link_limit_count,
         cached_browse: false,
         measured_at,
         summary_index,
@@ -2281,6 +2466,121 @@ mod tests {
     }
 
     #[test]
+    fn previously_empty_directories_refresh_additions_and_removals_without_recursing() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.0.join("empty")).unwrap();
+        let cancel = AtomicBool::new(false);
+        let full = analyze(&fixture.0, &cancel, |_| {}).unwrap();
+        let selected = directory_for_browse(&full, &full.root.children[0].id).unwrap();
+        assert!(!selected.has_children);
+        let previous_bytes = selected.bytes;
+        fixture.file("empty/arrived.bin", 16_384);
+        fixture.file("empty/new/deep/keep.bin", 65_536);
+        let parent = browse(
+            directory_for_browse(&full, &full.root.id).unwrap(),
+            Arc::clone(&full.summary_index),
+            full.total_bytes,
+            full.available_bytes,
+            &cancel,
+        )
+        .unwrap();
+        assert!(parent.root.children[0].has_children);
+        let opened = browse(
+            selected.clone(),
+            Arc::clone(&full.summary_index),
+            full.total_bytes,
+            full.available_bytes,
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(opened.root.bytes, previous_bytes);
+        assert_eq!(opened.root.size_source, "cached");
+        assert!(opened
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("此前分析")));
+        assert_eq!(opened.scanned_files, 1);
+        assert_eq!(opened.root.children.len(), 2);
+        let file = opened
+            .root
+            .children
+            .iter()
+            .find(|node| node.name == "arrived.bin")
+            .unwrap();
+        let stat = fs::symlink_metadata(fixture.0.join("empty/arrived.bin")).unwrap();
+        assert_eq!(file.bytes, stat.blocks() * 512);
+        assert_eq!(file.filesystem_identity(), (stat.dev(), stat.ino()));
+        let new = opened
+            .root
+            .children
+            .iter()
+            .find(|node| node.name == "new")
+            .unwrap();
+        assert_eq!(new.size_source, "unknown");
+        assert!(!new.size_known);
+        assert!(new.children.is_empty());
+        fs::remove_file(fixture.0.join("empty/arrived.bin")).unwrap();
+        fs::rename(fixture.0.join("empty/new"), fixture.0.join("moved-new")).unwrap();
+        let emptied = browse(
+            selected,
+            Arc::clone(&full.summary_index),
+            full.total_bytes,
+            full.available_bytes,
+            &cancel,
+        )
+        .unwrap();
+        assert!(emptied.root.children.is_empty());
+        assert!(!emptied.root.has_children);
+        assert!(fixture.0.join("moved-new/deep/keep.bin").exists());
+    }
+
+    #[test]
+    fn hard_link_identity_cap_keeps_walk_complete_and_reports_allocation_as_a_lower_bound() {
+        let fixture = Fixture::new();
+        let first = fixture.file("first.bin", 4_096);
+        fs::hard_link(&first, fixture.0.join("first-link.bin")).unwrap();
+        let second = fixture.file("second.bin", 8_192);
+        fs::hard_link(&second, fixture.0.join("second-link.bin")).unwrap();
+        let ordinary = fixture.file("ordinary.bin", 16_384);
+        let cancel = AtomicBool::new(false);
+        let mut ctx = Context::new(
+            &cancel,
+            |_| {},
+            "hard-link-cap".into(),
+            fs::metadata(&fixture.0).unwrap().dev(),
+        );
+        ctx.hard_link_capacity = 0;
+        let measured = measure(&fixture.0, 0, true, &mut ctx);
+        assert_eq!(measured.totals.files, 5);
+        assert!(measured.totals.partial);
+        assert_eq!(ctx.hard_links.len(), 0);
+        assert_eq!(ctx.hard_link_limit_count, 4);
+        let known = fs::symlink_metadata(&fixture.0).unwrap().blocks() * 512
+            + fs::symlink_metadata(ordinary).unwrap().blocks() * 512;
+        assert_eq!(measured.totals.bytes, known);
+        assert!(ctx.warnings.iter().any(|warning| warning.contains("下界")));
+        let node = measured.displayed.unwrap().node;
+        assert_eq!(node.children.len(), 5);
+        assert_eq!(
+            node.children.iter().filter(|node| !node.size_known).count(),
+            4
+        );
+
+        // A retained identity still deduplicates after the cap; unrelated
+        // unretained identities remain unknown on every visit.
+        let mut retained = Context::new(&cancel, |_| {}, "retained-hard-link".into(), ctx.device);
+        retained.hard_link_capacity = 1;
+        let first_stat = fs::symlink_metadata(first).unwrap();
+        let second_stat = fs::symlink_metadata(second).unwrap();
+        assert!(retained.record_metadata(&first_stat, false).bytes > 0);
+        assert_eq!(retained.record_metadata(&first_stat, false).bytes, 0);
+        assert!(retained.record_metadata(&second_stat, false).partial);
+        assert!(retained.record_metadata(&second_stat, false).partial);
+        assert_eq!(retained.hard_links.len(), 1);
+        assert_eq!(retained.hard_link_limit_count, 2);
+    }
+
+    #[test]
     fn browse_authorization_rejects_hidden_ids_other_scopes_and_replaced_directories() {
         let fixture = Fixture::new();
         fixture.file("a/b/c/d/inside.bin", 4_096);
@@ -2548,6 +2848,118 @@ mod tests {
         }
         assert!(threads.len() <= MAX_DIRECTORY_WORKERS);
         wait_for_directory_workers();
+    }
+
+    #[test]
+    fn protected_stream_buffers_one_batch_keeps_all_entries_and_frees_parent_capacity() {
+        let _lock = DIRECTORY_WORKER_TEST_LOCK.lock().unwrap();
+        wait_for_directory_workers();
+        let fixture = Fixture::new();
+        let directory = fixture.0.join("Users/example/Library/large");
+        let count = PROTECTED_DIRECTORY_BATCH_ENTRIES * 3 + 17;
+        for file in 0..count {
+            fixture.file(&format!("Users/example/Library/large/file-{file}.bin"), 32);
+        }
+        let cancel = AtomicBool::new(false);
+        let mut reader = directory_entries(&directory, &cancel)
+            .unwrap()
+            .prepare_progress(0, &cancel);
+        assert!(reader.progress_weights(0).is_none());
+        let DirectoryEntries::Protected(stream) = &reader else {
+            panic!("expected protected reader")
+        };
+        assert_eq!(stream.pending.len(), PROTECTED_DIRECTORY_BATCH_ENTRIES);
+        assert!(!stream.exhausted);
+        assert_eq!(ACTIVE_DIRECTORY_WORKERS.load(Ordering::Acquire), 0);
+        let mut names = HashSet::new();
+        while let Some(entry) = reader.next() {
+            names.insert(entry.unwrap().file_name());
+            let DirectoryEntries::Protected(stream) = &reader else {
+                unreachable!()
+            };
+            assert!(stream.pending.len() <= PROTECTED_DIRECTORY_BATCH_ENTRIES);
+            assert_eq!(ACTIVE_DIRECTORY_WORKERS.load(Ordering::Acquire), 0);
+        }
+        assert_eq!(names.len(), count);
+        // An ancestor keeps its bounded cursor, not a worker slot. More than
+        // four nested protected directories therefore remain fully readable.
+        let chain = (0..8)
+            .map(|level| format!("level-{level}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        fixture.file(
+            &format!("Users/example/Library/deep/{chain}/keep.bin"),
+            4_096,
+        );
+        let full = analyze(&fixture.0, &cancel, |_| {}).unwrap();
+        assert_eq!(full.root.files, count as u64 + 1);
+        assert!(!full.root.partial);
+        assert_eq!(full.directory_worker_limit_count, 0);
+        wait_for_directory_workers();
+    }
+
+    #[test]
+    fn protected_stream_counts_before_exhaustion_and_cancellation_leaves_work_partial() {
+        let _lock = DIRECTORY_WORKER_TEST_LOCK.lock().unwrap();
+        wait_for_directory_workers();
+        let fixture = Fixture::new();
+        let directory = fixture.0.join("Users/example/Library/large");
+        for file in 0..PROTECTED_DIRECTORY_BATCH_ENTRIES * 3 + 17 {
+            fixture.file(&format!("Users/example/Library/large/file-{file}.bin"), 32);
+        }
+        let cancel = AtomicBool::new(false);
+        let updates = std::cell::RefCell::new(Vec::new());
+        let mut ctx = Context::new(
+            &cancel,
+            |progress| {
+                if progress.scanned_files == 100 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                updates.borrow_mut().push(progress);
+            },
+            "protected-cancel".into(),
+            fs::metadata(&directory).unwrap().dev(),
+        );
+        ctx.unthrottled_progress = true;
+        let measured = measure(&directory, 0, true, &mut ctx);
+        assert_eq!(measured.totals.files, 100);
+        assert!(measured.totals.partial);
+        assert!(ctx.stopped);
+        assert_eq!(ctx.unknown_work_streams, 0);
+        assert_eq!(ctx.directory_timeout_count, 0);
+        assert!(updates
+            .borrow()
+            .iter()
+            .all(|progress| progress.estimated_percent.is_none()));
+        wait_for_directory_workers();
+    }
+
+    #[test]
+    fn timeout_and_exhausted_worker_diagnostics_are_separate_and_serialized() {
+        let fixture = Fixture::new();
+        let cancel = AtomicBool::new(false);
+        let mut ctx = Context::new(
+            &cancel,
+            |_| {},
+            "worker-diagnostics".into(),
+            fs::metadata(&fixture.0).unwrap().dev(),
+        );
+        directory_failure(&mut ctx, &fixture.0, DirectoryReadFailure::TimedOut);
+        directory_failure(&mut ctx, &fixture.0, DirectoryReadFailure::WorkerLimit);
+        assert_eq!(ctx.directory_timeout_count, 1);
+        assert_eq!(ctx.directory_worker_limit_count, 1);
+        assert_eq!(ctx.blocked_directory_count, 2);
+        assert_eq!(ctx.other_error_count, 2);
+        ctx.record_error(&io::Error::from(io::ErrorKind::TimedOut));
+        ctx.record_error(&io::Error::from(io::ErrorKind::WouldBlock));
+        assert_eq!(ctx.directory_timeout_count, 2);
+        assert_eq!(ctx.directory_worker_limit_count, 2);
+        assert_eq!(ctx.blocked_directory_count, 4);
+        let report = analyze(&fixture.0, &cancel, |_| {}).unwrap();
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["directoryTimeoutCount"], 0);
+        assert_eq!(json["directoryWorkerLimitCount"], 0);
+        assert_eq!(json["hardLinkLimitCount"], 0);
     }
 
     #[test]
