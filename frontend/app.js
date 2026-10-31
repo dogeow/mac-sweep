@@ -27,17 +27,20 @@
   document.querySelectorAll('[data-icon]').forEach((el) => { el.innerHTML = icon(el.dataset.icon); });
   const $ = (id) => document.getElementById(id);
   const escape = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
-  const labels = { all: '所有项目', cache: '应用缓存', logs: '旧日志', installer: '安装包', orphan: '卸载后可能留下的文件' };
-  const explanations = { cache: '应用、浏览器和工具暂存的内容。清理后可能需要重新下载或编译，工具缓存请手动确认。', logs: '旧日志是应用运行和故障的记录。清理后无法查看这些旧记录。', installer: '这些是下载的安装文件。确认应用已安装，且不再需要安装包。', orphan: '没有找到对应应用。这些文件可能含有设置、文档或账户数据，请确认不再需要。' };
-  const categories = ['cache', 'logs', 'installer', 'orphan'];
-  const categoryIcons = { cache: 'layers', logs: 'file', installer: 'download', orphan: 'box' };
+  const labels = { all: '所有项目', cache: '应用缓存', logs: '旧日志', installer: '安装包', download: '未完成的下载', orphan: '卸载后可能留下的文件' };
+  const explanations = { cache: '应用、浏览器和工具暂存的内容。清理后可能需要重新下载或编译，工具缓存请手动确认。', logs: '旧日志是应用运行和故障的记录。清理后无法查看这些旧记录。', installer: '这些是下载的安装文件。已标明对应应用是否已经安装。', download: '浏览器中断后留下的临时下载文件，不能直接使用。', orphan: '没有找到对应应用。这些文件可能含有设置、文档或账户数据，请确认不再需要。' };
+  const categories = ['cache', 'logs', 'installer', 'download', 'orphan'];
+  const categoryIcons = { cache: 'layers', logs: 'file', installer: 'download', download: 'download', orphan: 'box' };
+  const safetyLevels = ['safe', 'review', 'caution'];
+  const safetyLabels = { safe: '可放心清理', review: '建议确认', caution: '谨慎处理' };
+  const safetyHints = { safe: '只含可重新生成的内容', review: '可能仍有用途，先看说明', caution: '可能含设置或个人数据' };
   const desktop = typeof window.__TAURI__?.core?.invoke === 'function' && typeof window.__TAURI__?.event?.listen === 'function';
   const demo = new URLSearchParams(window.location.search).get('demo') === '1';
   const invoke = (name, args) => window.__TAURI__.core.invoke(name, args);
   const PAGE_SIZE = 100;
   const GROUP_PAGE_SIZE = 30;
   const cleanupModel = window.MacSweepCleanup;
-  const state = { view: 'home', analysisBusy: false, report: null, diskOverview: null, diskUnavailable: false, selected: new Set(), moved: new Set(), failures: new Map(), unknownMoves: new Set(), receipts: [], cleanOutcome: null, blockedUntilRescan: false, groups: new Map(), expanded: new Set(), expandedTree: new Set(), expandedFileInfo: new Set(), treePages: new Map(), treeNodes: new Map(), filter: 'all', search: '', risk: 'all', sort: 'size-desc', page: 1, scanning: false, cancelling: false, cleaning: false, scanRevision: 0, dialogSelection: null, previousFocus: null, message: null, extraWarnings: [] };
+  const state = { view: 'home', analysisBusy: false, report: null, diskOverview: null, diskUnavailable: false, selected: new Set(), moved: new Set(), failures: new Map(), unknownMoves: new Set(), receipts: [], cleanOutcome: null, blockedUntilRescan: false, groups: new Map(), expanded: new Set(), expandedTree: new Set(), expandedFileInfo: new Set(), treePages: new Map(), treeNodes: new Map(), filter: 'all', search: '', safety: 'all', sort: 'size-desc', page: 1, scanning: false, cancelling: false, cleaning: false, scanRevision: 0, dialogSelection: null, previousFocus: null, message: null, extraWarnings: [] };
   const bytes = (value) => {
     const number = Number(value) || 0;
     if (number === 0) return '0 B';
@@ -52,7 +55,7 @@
   const selectedItems = () => activeItems().filter((item) => state.selected.has(item.id));
   const visibleItems = () => {
     const query = state.search.toLocaleLowerCase();
-    return activeItems().filter((item) => (state.filter === 'all' || item.category === state.filter) && (state.risk === 'all' || item.risk === state.risk) && (!query || `${item.name} ${item.path} ${item.reason} ${item.appName || ''}`.toLocaleLowerCase().includes(query))).sort((a, b) => {
+    return activeItems().filter((item) => (state.filter === 'all' || item.category === state.filter) && (state.safety === 'all' || cleanupModel.safetyOf(item) === state.safety) && (!query || `${item.name} ${item.path} ${item.reason} ${item.impact || ''} ${item.appName || ''}`.toLocaleLowerCase().includes(query))).sort((a, b) => {
       if (state.sort === 'size-asc') return a.bytes - b.bytes;
       if (state.sort === 'date-asc') return (a.modifiedAt || 0) - (b.modifiedAt || 0);
       if (state.sort === 'name-asc') return String(a.name).localeCompare(String(b.name), 'zh-CN');
@@ -145,8 +148,8 @@
   }
   function renderHome() {
     const items = activeItems();
-    const suggested = items.filter((item) => item.selectedByDefault === true);
-    const manual = items.filter((item) => item.selectedByDefault !== true);
+    const suggested = items.filter((item) => cleanupModel.safetyOf(item) === 'safe');
+    const manual = items.filter((item) => cleanupModel.safetyOf(item) !== 'safe');
     const busy = state.scanning || state.cleaning || state.analysisBusy;
     $('home-start-scan').disabled = busy || !desktop || demo;
     $('home-scan-text').textContent = state.scanning ? '检查中…' : state.report ? '重新检查' : '开始检查';
@@ -169,8 +172,8 @@
       $('home-result-summary').textContent = state.moved.size ? '选中的内容已移到废纸篓' : '这次没有发现建议清理的内容';
       $('home-result-detail').textContent = state.report.cancelled ? '检查提前停止，结果可能不完整。可重新检查。' : state.moved.size ? '到废纸篓检查文件，自行清空后才会释放空间。' : '你也可以查看文件夹大小，找出空间用在哪里。';
     } else {
-      $('home-result-summary').textContent = suggested.length ? `建议检查 ${bytes(sum(suggested))} 的内容` : '有些内容需要你确认';
-      $('home-result-detail').textContent = `${suggested.length ? '主要是旧缓存与日志。' : ''}${manual.length ? `另有 ${bytes(sum(manual))} 的内容需要手动确认，可在结果中查看。` : '查看说明，保留你还需要的内容。'}${state.report.cancelled ? ' 检查提前停止，这是部分结果。' : ''}`;
+      $('home-result-summary').textContent = suggested.length ? `${bytes(sum(suggested))} 可放心清理` : '有些内容需要你确认';
+      $('home-result-detail').textContent = `${suggested.length ? '只包含可重新生成的缓存、旧日志等内容。' : ''}${manual.length ? `另有 ${bytes(sum(manual))} 需要你确认后再选择。` : '查看说明，保留你还需要的内容。'}${state.report.cancelled ? ' 检查提前停止，这是部分结果。' : ''}`;
     }
     if (!state.scanning && state.report && ((state.report.warnings || []).length || state.extraWarnings.length)) {
       $('home-result-detail').textContent += ' 检查过程中有提示，查看检查结果了解详情。';
@@ -186,7 +189,7 @@
     const failure = state.failures.get(item.id);
     const uncertain = state.unknownMoves.has(item.id);
     const infoOpen = state.expandedFileInfo.has(item.id);
-    return `<div class="tree-file${failure ? ' failed' : ''}" data-tree-depth="${Math.min(depth, 5)}"><div class="tree-file-row"><input type="checkbox" data-item-id="${escape(item.id)}" ${state.selected.has(item.id) ? 'checked' : ''} ${busy ? 'disabled' : ''} aria-label="选择 ${escape(item.name)}" /><span class="tree-file-icon">${icon(item.isDirectory ? 'folder' : 'file')}</span><strong class="tree-file-name" title="${escape(item.name)}">${escape(item.name)}</strong>${failure ? `<span class="tree-failure-count">${uncertain ? '结果未确认' : '未能移动'}</span>` : ''}<span class="tree-file-size">${bytes(item.bytes)}</span><button class="tree-file-info-button" data-file-info="${escape(item.id)}" aria-expanded="${infoOpen}" aria-label="${infoOpen ? '收起' : '查看'} ${escape(item.name)} 的${failure ? '失败原因与' : ''}文件信息" title="${failure ? '查看失败原因与文件信息' : '查看文件信息'}" ${busy ? 'disabled' : ''}>${icon('info')}</button><button class="row-reveal" data-reveal-id="${escape(item.id)}" title="在 Finder 中显示此项目" aria-label="在 Finder 中显示 ${escape(item.name)}" ${!desktop || demo || busy ? 'disabled' : ''}>${icon('folder')}</button></div>${infoOpen ? `<div class="tree-file-info">${failure ? `<p class="tree-file-error">${uncertain ? '' : '未能移动：'}${escape(failure)}</p>` : ''}<p>${escape(item.reason)}</p><code>${escape(item.path)}</code><p class="tree-file-meta">修改于 ${date(item.modifiedAt)} · ${Number(item.files || 0).toLocaleString()} 个文件</p></div>` : ''}</div>`;
+    return `<div class="tree-file${failure ? ' failed' : ''}" data-tree-depth="${Math.min(depth, 5)}"><div class="tree-file-row"><input type="checkbox" data-item-id="${escape(item.id)}" ${state.selected.has(item.id) ? 'checked' : ''} ${busy ? 'disabled' : ''} aria-label="选择 ${escape(item.name)}" /><span class="tree-file-icon">${icon(item.isDirectory ? 'folder' : 'file')}</span><strong class="tree-file-name" title="${escape(item.name)}">${escape(item.name)}</strong>${failure ? `<span class="tree-failure-count">${uncertain ? '结果未确认' : '未能移动'}</span>` : ''}<span class="tree-file-size">${bytes(item.bytes)}</span><button class="tree-file-info-button" data-file-info="${escape(item.id)}" aria-expanded="${infoOpen}" aria-label="${infoOpen ? '收起' : '查看'} ${escape(item.name)} 的${failure ? '失败原因与' : ''}文件信息" title="${failure ? '查看失败原因与文件信息' : '查看文件信息'}" ${busy ? 'disabled' : ''}>${icon('info')}</button><button class="row-reveal" data-reveal-id="${escape(item.id)}" title="在 Finder 中显示此项目" aria-label="在 Finder 中显示 ${escape(item.name)}" ${!desktop || demo || busy ? 'disabled' : ''}>${icon('folder')}</button></div>${infoOpen ? `<div class="tree-file-info">${failure ? `<p class="tree-file-error">${uncertain ? '' : '未能移动：'}${escape(failure)}</p>` : ''}${item.impact ? `<p class="tree-file-impact"><b>删除后：</b>${escape(item.impact)}</p>` : ''}<p>${escape(item.reason)}</p><code>${escape(item.path)}</code><p class="tree-file-meta">修改于 ${date(item.modifiedAt)} · ${Number(item.files || 0).toLocaleString()} 个文件</p></div>` : ''}</div>`;
   }
   function renderTreeFiles(node, key, busy, depth) {
     if (!node.files.length) return '';
@@ -212,8 +215,10 @@
       const open = state.expanded.has(group.key);
       const count = `${filtered ? '当前筛选 · ' : ''}${group.items.length.toLocaleString()} ${group.fileCount > group.items.length ? `处 · ${group.fileCount.toLocaleString()} 个文件` : '项'}`;
       const tree = open ? cleanupModel.buildDirectoryTree(group.items, state.sort) : [];
-      const directories = open ? `<div class="group-tree"><p class="group-tree-note">${escape(explanations[group.category] || '')} 仅处理本次列出的候选；整目录候选会包含其中全部子项。</p>${tree.map((node) => renderTreeDirectory(node, group, busy)).join('')}</div>` : '';
-      return `<article class="cleanup-group${selected.count ? ' selected' : ''}${failures.length ? ' failed' : ''}"><div class="group-row"><input type="checkbox" data-group-id="${escape(group.key)}" ${selected.checked ? 'checked' : ''} ${busy || (!group.suggested && !open) ? 'disabled' : ''} aria-label="选择 ${escape(group.name)} 的全部 ${group.items.length} 个匹配项目" /><span class="group-icon ${escape(group.category)}">${icon(categoryIcons[group.category])}</span><div class="group-name"><strong>${escape(group.name)}</strong><span>${escape(labels[group.category] || group.category)} · ${count}</span></div>${!group.suggested ? '<span class="group-badge review">需确认</span>' : ''}<strong class="group-size">${bytes(group.bytes)}</strong></div>${failures.length ? `<p class="group-error">${failures.some(item => state.unknownMoves.has(item.id)) ? '部分移动结果未确认，检查 Finder 后重新检查' : `${failures.length} 项未能移动，展开查看原因`}</p>` : ''}<details class="group-details" data-group-details="${escape(group.key)}" ${open ? 'open' : ''}><summary title="${open ? '收起' : '查看'} ${escape(group.name)} 的目录" aria-label="${open ? '收起' : '查看'} ${escape(group.name)} 的目录" aria-disabled="${busy}"><span class="sr-only">查看目录</span><span class="group-chevron">${icon('chevron-down')}</span></summary>${directories}</details></article>`;
+      const impacts = [...new Set(group.items.map((item) => item.impact).filter(Boolean))];
+      const impactNote = impacts.length === 1 ? `<strong>删除后：</strong>${escape(impacts[0])} ` : '';
+      const directories = open ? `<div class="group-tree"><p class="group-tree-note">${impactNote}${escape(explanations[group.category] || '')} 仅处理本次列出的候选；整目录候选会包含其中全部子项。</p>${tree.map((node) => renderTreeDirectory(node, group, busy)).join('')}</div>` : '';
+      return `<article class="cleanup-group safety-${group.safety}${selected.count ? ' selected' : ''}${failures.length ? ' failed' : ''}"><div class="group-row"><input type="checkbox" data-group-id="${escape(group.key)}" ${selected.checked ? 'checked' : ''} ${busy || (group.safety !== 'safe' && !open) ? 'disabled' : ''} aria-label="选择 ${escape(group.name)} 的全部 ${group.items.length} 个匹配项目" /><span class="group-icon ${escape(group.category)}">${icon(categoryIcons[group.category])}</span><div class="group-name"><strong>${escape(group.name)}</strong><span>${escape(labels[group.category] || group.category)} · ${count}</span></div><span class="group-badge ${group.safety}" title="${escape(safetyHints[group.safety])}">${safetyLabels[group.safety]}</span><strong class="group-size">${bytes(group.bytes)}</strong></div>${failures.length ? `<p class="group-error">${failures.some(item => state.unknownMoves.has(item.id)) ? '部分移动结果未确认，检查 Finder 后重新检查' : `${failures.length} 项未能移动，展开查看原因`}</p>` : ''}<details class="group-details" data-group-details="${escape(group.key)}" ${open ? 'open' : ''}><summary title="${open ? '收起' : '查看'} ${escape(group.name)} 的目录" aria-label="${open ? '收起' : '查看'} ${escape(group.name)} 的目录" aria-disabled="${busy}"><span class="sr-only">查看目录</span><span class="group-chevron">${icon('chevron-down')}</span></summary>${directories}</details></article>`;
     }).join('');
     $('result-rows').querySelectorAll('[data-tree-depth]').forEach((element) => {
       element.style.setProperty('--tree-depth', Number(element.dataset.treeDepth));
@@ -225,6 +230,21 @@
       const entry = state.treeNodes.get(checkbox.dataset.treeId);
       checkbox.indeterminate = cleanupModel.selectedState(entry.node, state.selected).indeterminate;
     });
+  }
+  function renderSafetyOverview(items, busy) {
+    const overview = $('safety-overview');
+    overview.classList.toggle('hidden', !items.length);
+    if (!items.length) return;
+    const total = sum(items) || 1;
+    const levels = safetyLevels.map((level) => {
+      const group = items.filter((item) => cleanupModel.safetyOf(item) === level);
+      return { level, bytes: sum(group), count: group.length, selected: group.filter((item) => state.selected.has(item.id)).length };
+    });
+    $('safety-bar').innerHTML = levels.filter((entry) => entry.bytes > 0).map((entry) => `<span class="${entry.level}" style="flex-grow: ${Math.max(entry.bytes / total, 0.015)}"></span>`).join('');
+    $('safety-tiles').innerHTML = levels.map((entry) => {
+      const active = state.safety === entry.level;
+      return `<button class="safety-tile ${entry.level}${active ? ' active' : ''}" data-safety="${entry.level}" aria-pressed="${active}" ${busy || !entry.count ? 'disabled' : ''} title="${active ? '再次点击显示全部' : `只看${safetyLabels[entry.level]}`}"><span class="safety-dot"></span><span class="safety-copy"><strong>${safetyLabels[entry.level]}</strong><small>${entry.count ? `${entry.count.toLocaleString()} 项${entry.selected ? ` · 已选 ${entry.selected.toLocaleString()}` : ''}` : '无'} · ${safetyHints[entry.level]}</small></span><b>${bytes(entry.bytes)}</b></button>`;
+    }).join('');
   }
   function render() {
     const items = activeItems();
@@ -282,17 +302,18 @@
     }
     $('empty-scan').classList.toggle('hidden', Boolean(state.report) || state.scanning);
     $('empty-scan').disabled = busy || !desktop || demo;
-    renderGroups(groupPage.items, busy, Boolean(state.search || state.filter !== 'all' || state.risk !== 'all'));
+    renderGroups(groupPage.items, busy, Boolean(state.search || state.filter !== 'all' || state.safety !== 'all'));
+    renderSafetyOverview(items, busy);
     const all = $('select-all');
-    const pageSuggested = pageItems.filter((item) => item.selectedByDefault === true);
+    const pageSuggested = pageItems.filter((item) => cleanupModel.safetyOf(item) === 'safe');
     all.checked = pageSuggested.length > 0 && pageSuggested.every((item) => state.selected.has(item.id));
     all.indeterminate = !all.checked && pageSuggested.some((item) => state.selected.has(item.id));
     all.disabled = busy || pageSuggested.length === 0;
-    all.setAttribute('aria-label', `选择当前列表中的 ${pageSuggested.length} 个建议项`);
-    $('select-safe').disabled = busy || !visible.some((item) => item.selectedByDefault === true);
+    all.setAttribute('aria-label', `选择当前列表中 ${pageSuggested.length} 个可放心清理的项目`);
+    $('select-safe').disabled = busy || !visible.some((item) => cleanupModel.safetyOf(item) === 'safe');
     $('clear-selection').disabled = busy || selected.length === 0;
     $('selection-count').textContent = selected.length ? `已选 ${bytes(sum(selected))}` : '请选择要清理的内容';
-    const reviewCount = selected.filter((item) => item.risk !== 'low').length;
+    const reviewCount = selected.filter((item) => cleanupModel.safetyOf(item) !== 'safe').length;
     $('selection-description').textContent = state.blockedUntilRescan ? '上次移动结果未确认，请完成重新检查后再清理。' : selected.length ? (reviewCount ? `包含 ${reviewCount} 项需要你确认的内容` : '移到废纸篓前，会再次让你确认。') : '移到废纸篓前，会再次让你确认。';
     $('review-cleanup').disabled = busy || selected.length === 0 || !desktop || demo || state.blockedUntilRescan;
     $('review-cleanup').title = demo ? '演示模式禁止清理' : !desktop ? '请在桌面应用中使用' : '';
@@ -391,10 +412,11 @@
       const group = selected.filter((item) => item.category === category);
       return group.length ? `<div><span>${icon(categoryIcons[category])}${labels[category]}<small>${group.length} 项</small></span><strong>${bytes(sum(group))}</strong></div>` : '';
     }).join('');
-    const reviewItems = selected.filter((item) => item.risk !== 'low');
+    const reviewItems = selected.filter((item) => cleanupModel.safetyOf(item) !== 'safe');
+    const cautionCount = selected.filter((item) => cleanupModel.safetyOf(item) === 'caution').length;
     const orphanCount = selected.filter((item) => item.category === 'orphan').length;
     $('dialog-warning').classList.toggle('hidden', reviewItems.length === 0);
-    $('dialog-warning').querySelector('p').textContent = orphanCount ? `包含 ${orphanCount} 项可能遗留的应用数据，可能保存设置、文档或账户。没有找到应用，不代表这些数据没用。请确认不再需要。` : `包含 ${reviewItems.length} 个需要确认的项目。安装包或工具缓存可能仍在使用，请核实后再继续。`;
+    $('dialog-warning').querySelector('p').textContent = cautionCount ? `包含 ${cautionCount} 项「谨慎处理」的应用数据，可能保存设置、文档或账户。没有找到应用，不代表这些数据没用。请确认不再需要。` : orphanCount ? `包含 ${orphanCount} 项疑似卸载残留。没有找到应用不代表已经卸载，请确认不再需要。` : `包含 ${reviewItems.length} 个「建议确认」的项目。安装包或工具缓存可能仍在使用，请核实后再继续。`;
     $('dialog-progress').classList.add('hidden');
     $('dialog-cancel').disabled = false;
     $('dialog-confirm').disabled = false;
@@ -562,7 +584,6 @@
     document.addEventListener('pointerdown', (event) => { if (!$('scan-settings').classList.contains('hidden') && !$('scan-settings').contains(event.target) && !$('toggle-settings').contains(event.target)) closeSettings(); });
     document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && !$('scan-settings').classList.contains('hidden')) { event.preventDefault(); closeSettings(); $('toggle-settings').focus(); } });
     $('search').addEventListener('input', (event) => { state.search = event.target.value; state.page = 1; render(); });
-    $('risk-filter').addEventListener('change', (event) => { state.risk = event.target.value; state.page = 1; render(); });
     $('sort').addEventListener('change', (event) => { state.sort = event.target.value; state.page = 1; render(); });
     $('previous-page').addEventListener('click', () => { if (state.page <= 1) return; state.page -= 1; render(); $('result-table').scrollIntoView({ block: 'start' }); });
     $('next-page').addEventListener('click', () => { if (state.page >= Math.ceil(cleanupModel.groupItems(visibleItems(), state.sort).length / GROUP_PAGE_SIZE)) return; state.page += 1; render(); $('result-table').scrollIntoView({ block: 'start' }); });
@@ -573,7 +594,7 @@
       const tree = checkbox.dataset.treeId ? state.treeNodes.get(checkbox.dataset.treeId) : null;
       const group = tree ? state.groups.get(tree.groupKey) : checkbox.dataset.groupId ? state.groups.get(checkbox.dataset.groupId) : null;
       if ((checkbox.dataset.treeId && !tree) || (checkbox.dataset.groupId && !group)) return;
-      if (group && !group.suggested && !state.expanded.has(group.key)) return;
+      if (group && group.safety !== 'safe' && !state.expanded.has(group.key)) return;
       const targets = tree ? tree.node.items : group ? group.items : visibleItems().filter((item) => item.id === checkbox.dataset.itemId);
       targets.forEach((item) => { if (checkbox.checked) state.selected.add(item.id); else state.selected.delete(item.id); });
       const attribute = tree ? 'treeId' : group ? 'groupId' : 'itemId';
@@ -630,8 +651,16 @@
       const button = event.target.closest('[data-reveal-id]');
       if (button && !button.disabled) revealItem(button.dataset.revealId);
     });
-    $('select-all').addEventListener('change', (event) => { if (state.scanning || state.cleaning || state.analysisBusy) return; currentPageItems().filter((item) => item.selectedByDefault === true).forEach((item) => { if (event.target.checked) state.selected.add(item.id); else state.selected.delete(item.id); }); render(); });
-    $('select-safe').addEventListener('click', () => { if (state.scanning || state.cleaning || state.analysisBusy) return; visibleItems().filter((item) => item.selectedByDefault === true).forEach((item) => state.selected.add(item.id)); render(); });
+    $('select-all').addEventListener('change', (event) => { if (state.scanning || state.cleaning || state.analysisBusy) return; currentPageItems().filter((item) => cleanupModel.safetyOf(item) === 'safe').forEach((item) => { if (event.target.checked) state.selected.add(item.id); else state.selected.delete(item.id); }); render(); });
+    $('select-safe').addEventListener('click', () => { if (state.scanning || state.cleaning || state.analysisBusy) return; visibleItems().filter((item) => cleanupModel.safetyOf(item) === 'safe').forEach((item) => state.selected.add(item.id)); render(); });
+    $('safety-tiles').addEventListener('click', (event) => {
+      const tile = event.target.closest('[data-safety]');
+      if (!tile || tile.disabled || state.scanning || state.cleaning || state.analysisBusy) return;
+      state.safety = state.safety === tile.dataset.safety ? 'all' : tile.dataset.safety;
+      state.page = 1;
+      render();
+      $('safety-tiles').querySelector(`[data-safety="${tile.dataset.safety}"]`)?.focus({ preventScroll: true });
+    });
     $('clear-selection').addEventListener('click', () => { if (state.scanning || state.cleaning || state.analysisBusy) return; state.selected.clear(); render(); });
     $('review-cleanup').addEventListener('click', openReview);
     $('dialog-cancel').addEventListener('click', closeReview);
@@ -665,14 +694,17 @@
   function demoReport() {
     const now = Math.floor(Date.now() / 1000);
     const data = [
-      ['preview-cache-1', '/Users/demo/Library/Caches/com.example.browser', '浏览器缓存', 'cache', 'low', 2197815296, 4632, '14 天以上未修改的应用缓存，可重新生成。', true],
-      ['preview-installer-1', '/Users/demo/Downloads/DesignTool.dmg', 'DesignTool.dmg', 'installer', 'review', 981467136, 1, 'Downloads 中 42 天前的安装包，请确认无需再次使用。', false],
-      ['preview-orphan-1', '/Users/demo/Library/Application Support/OldSketch', 'OldSketch', 'orphan', 'review', 732954624, 248, '未匹配到已安装应用。可能包含个人数据，需要核实。', false],
-      ['preview-cache-2', '/Users/demo/Library/Caches/com.example.editor', '编辑器缓存', 'cache', 'low', 443547648, 827, '32 天以上未修改的应用缓存，可重新生成。', true],
-      ['preview-logs-1', '/Users/demo/Library/Logs/DiagnosticReports/old-report.ips', 'old-report.ips', 'logs', 'low', 921600, 1, '历史诊断报告，最后修改时间早于 14 天。', true],
-      ['preview-logs-2', '/Users/demo/Library/Logs/ExampleApp', 'ExampleApp 日志', 'logs', 'low', 53870592, 128, '历史运行日志，清理后将无法查看这些旧记录。', true],
+      ['preview-cache-1', '/Users/demo/Library/Caches/com.example.browser', '浏览器缓存', 'cache', 'low', 2197815296, 4632, '14 天以上未修改的应用缓存，可重新生成。', true, 'safe', '应用下次启动时会重新生成，首次打开可能稍慢。'],
+      ['preview-xcode-1', '/Users/demo/Library/Developer/Xcode/DerivedData/DemoApp-abc', 'DemoApp-abc', 'cache', 'review', 1610612736, 9120, '只包含可重新生成的编译缓存，相关工具当前未运行。', false, 'safe', '下次编译会重新构建，首次编译变慢。'],
+      ['preview-installer-1', '/Users/demo/Downloads/DesignTool.dmg', 'DesignTool.dmg', 'installer', 'review', 981467136, 1, '下载目录中的旧安装包，对应的应用已经安装在本机。', false, 'safe', '已安装「DesignTool」；以后重装需要重新下载安装包。'],
+      ['preview-installer-2', '/Users/demo/Downloads/OtherTool.pkg', 'OtherTool.pkg', 'installer', 'review', 214748364, 1, '下载目录中的旧磁盘镜像或安装包，可能用于重装或离线使用；需手动确认。', false, 'review', '未找到对应的已安装应用；可能还没安装，或留作离线重装。'],
+      ['preview-download-1', '/Users/demo/Downloads/video.mp4.crdownload', 'video.mp4.crdownload', 'download', 'review', 157286400, 1, '未完成的浏览器下载，超过保留天数且没有继续下载。', false, 'safe', '下载需要重新开始。'],
+      ['preview-orphan-1', '/Users/demo/Library/Application Support/com.example.oldsketch', 'com.example.oldsketch', 'orphan', 'review', 732954624, 248, '未匹配到已安装应用。可能包含个人数据，需要核实。', false, 'caution', '可能包含该应用的设置、文档或账户数据；放回前，应用内无法找回。'],
+      ['preview-cache-2', '/Users/demo/Library/Caches/com.example.editor', '编辑器缓存', 'cache', 'low', 443547648, 827, '32 天以上未修改的应用缓存，可重新生成。', true, 'safe', '应用下次启动时会重新生成，首次打开可能稍慢。'],
+      ['preview-logs-1', '/Users/demo/Library/Logs/DiagnosticReports/old-report.ips', 'old-report.ips', 'logs', 'low', 921600, 1, '历史诊断报告，最后修改时间早于 14 天。', true, 'safe', '无法再查看这些旧日志或崩溃报告。'],
+      ['preview-logs-2', '/Users/demo/Library/Logs/ExampleApp', 'ExampleApp 日志', 'logs', 'low', 53870592, 128, '历史运行日志，清理后将无法查看这些旧记录。', true, 'safe', '无法再查看这些旧日志或崩溃报告。'],
     ];
-    return { scanId: 'explicit-browser-demo', startedAt: now, durationMs: 4800, disk: { totalBytes: 1024 ** 4, availableBytes: 312 * (1024 ** 3) }, items: data.map(([id, path, name, category, risk, size, files, reason, selectedByDefault], index) => ({ id, path, name, category, risk, bytes: size, files, modifiedAt: now - (18 + index * 7) * 86400, reason, selectedByDefault })), warnings: ['演示提示：受保护的应用数据位置需要额外访问权限；这些位置不包含在示例结果中。'], installedAppCount: 47, scannedFiles: 68439, cancelled: false };
+    return { scanId: 'explicit-browser-demo', startedAt: now, durationMs: 4800, disk: { totalBytes: 1024 ** 4, availableBytes: 312 * (1024 ** 3) }, items: data.map(([id, path, name, category, risk, size, files, reason, selectedByDefault, safety, impact], index) => ({ id, path, name, category, risk, bytes: size, files, modifiedAt: now - (18 + index * 7) * 86400, reason, selectedByDefault, safety, impact })), warnings: ['演示提示：受保护的应用数据位置需要额外访问权限；这些位置不包含在示例结果中。'], installedAppCount: 47, scannedFiles: 68439, cancelled: false };
   }
   let diskRevision = 0;
   async function refreshDisk() {

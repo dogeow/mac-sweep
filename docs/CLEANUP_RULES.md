@@ -23,10 +23,21 @@
 | 其他开发缓存 | `~/.gradle/caches`、`~/Library/Caches/Homebrew`、`CocoaPods` | 手动确认，可能需要重新下载或影响离线工作 |
 | Xcode 编译缓存 | `~/Library/Developer/Xcode/DerivedData`、`~/Library/Caches/com.apple.dt.Xcode` | 手动确认；不包含 Archives、DeviceSupport 或模拟器数据 |
 | 旧日志与崩溃报告 | `~/Library/Logs` 内的 `.log`、`.txt`、`.crash`、`.ips`、`.out`、`.err`、`.trace` 与轮转日志 | 建议项；保留目录与最近日志，不将整日志目录作为候选 |
-| 旧安装包 | `~/Downloads` 直属 `.dmg`、`.pkg`、`.mpkg`、`.iso` | 手动确认；普通 ZIP、文档、备份与项目不是安装包 |
+| 旧安装包 | `~/Downloads` 直属 `.dmg`、`.pkg`、`.mpkg`、`.iso` | 手动确认；对应应用已安装时判为可放心清理；普通 ZIP、文档、备份与项目不是安装包 |
+| 未完成的下载 | `~/Downloads` 直属 `.crdownload`、`.part`、`.download`、`.opdownload` | 手动确认；判为可放心清理 |
 | 疑似卸载残留 | Preferences、Application Support、Caches 内的反向域名条目，及 Saved Application State 的 `<标识>.savedState` | 手动确认；应用清单完整、找不到同标识或同开发者应用才列出。缺少应用不等于已经卸载 |
 
 缓存根目录本身保留。符号链接不跟随，多硬链接文件不作为候选；扫描遇到不可读取、结构变化或无法完整重验的分支时保留该分支。新增加的缓存规则一律不默认勾选。
+
+## 可删除程度
+
+每个候选附带一个结论和删除后的影响说明，与默认勾选分开：
+
+- **可放心清理**：默认建议项；已知只含可重新生成内容的下载、编译与网页缓存（固定缓存来源中除 pnpm 存储外的全部，以及 Application Support 下 Electron 的缓存文件夹）；对应应用已安装的安装包；未完成的下载。
+- **建议确认**：运行时工具缓存、沙盒容器缓存、未找到应用的安装包、疑似卸载残留的缓存、偏好与窗口状态。
+- **谨慎处理**：Application Support 中疑似卸载残留的整个数据目录，可能含设置、文档或账户。
+
+无法完整确认正在运行的应用、或应用归属不明确时，一律不判为可放心清理。
 
 ## 覆盖与数量限制
 

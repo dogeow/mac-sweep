@@ -1,6 +1,9 @@
 (function (root) {
   'use strict';
-  const fallback = { cache: '其他应用缓存', logs: '其他旧日志', installer: '下载的安装包', orphan: '未识别的应用数据' };
+  const fallback = { cache: '其他应用缓存', logs: '其他旧日志', installer: '下载的安装包', download: '未完成的下载', orphan: '未识别的应用数据' };
+  const safetyRank = { safe: 0, review: 1, caution: 2 };
+  // Reports from older versions have no verdict: only default suggestions count as safe.
+  const safetyOf = (item) => Object.hasOwn(safetyRank, item?.safety) ? item.safety : item?.selectedByDefault === true ? 'safe' : 'review';
   const size = (item) => Number.isFinite(Number(item.bytes)) ? Math.max(0, Number(item.bytes)) : 0;
   const fileCount = (item) => item.files == null ? 1 : Math.max(0, Number(item.files) || 0);
   const directoryHint = (item) => item.kind === 'directory' || item.isDirectory === true || (Number.isFinite(item.files) && item.files !== 1) || String(item.path || '').endsWith('/');
@@ -49,9 +52,10 @@
     const groups = new Map();
     for (const item of uniqueItems(items)) {
       const suggested = item.selectedByDefault === true;
+      const safety = safetyOf(item);
       const name = ownerName(item);
-      const key = JSON.stringify([item.category, suggested, name]);
-      if (!groups.has(key)) groups.set(key, { key, name, category: item.category, suggested, items: [], bytes: 0, modifiedAt: Infinity });
+      const key = JSON.stringify([item.category, suggested, name, safety]);
+      if (!groups.has(key)) groups.set(key, { key, name, category: item.category, suggested, safety, items: [], bytes: 0, modifiedAt: Infinity });
       const group = groups.get(key);
       group.items.push(item);
       const modified = Number(item.modifiedAt) || 0;
@@ -101,6 +105,7 @@
     const groups = partitions(items);
     for (const group of groups) { const total = candidateTotals(group.items); group.bytes = total.bytes; group.fileCount = total.fileCount; group.candidateCount = group.items.length; }
     return groups.sort((a, b) => {
+      if (a.safety !== b.safety) return safetyRank[a.safety] - safetyRank[b.safety];
       if (a.suggested !== b.suggested) return a.suggested ? -1 : 1;
       return compare(sort, a, b);
     });
@@ -178,7 +183,7 @@
     const offset = (page - 1) * pageSize;
     return { page, pages, items: items.slice(offset, offset + pageSize), first: items.length ? offset + 1 : 0, last: Math.min(offset + pageSize, items.length) };
   }
-  const api = Object.freeze({ groupItems, buildDirectoryTree, selectedState, pageItems });
+  const api = Object.freeze({ groupItems, buildDirectoryTree, selectedState, pageItems, safetyOf });
   if (typeof module === 'object' && module.exports) module.exports = api;
   else root.MacSweepCleanup = api;
 })(typeof window === 'object' ? window : globalThis);
