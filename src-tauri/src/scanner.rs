@@ -65,6 +65,11 @@ pub struct CleanupItem {
     pub is_directory: bool,
     pub modified_at: u64,
     pub reason: String,
+    /// Deletability verdict: `safe` (regenerable, no user data), `review`
+    /// (probably unneeded but check first) or `caution` (may hold user data).
+    pub safety: &'static str,
+    /// What the user loses or must redo after moving this item to Trash.
+    pub impact: String,
     pub selected_by_default: bool,
     pub app_name: Option<String>,
     pub bundle_id: Option<String>,
@@ -194,6 +199,7 @@ enum Rule {
     RebuildableCache,
     Log,
     Installer,
+    PartialDownload,
     OrphanPreference,
     OrphanMetadata,
     OrphanState,
@@ -677,6 +683,115 @@ fn is_installer(path: &Path) -> bool {
     )
 }
 
+// Abandoned browser downloads: Chrome, Firefox, Safari (bundle) and Opera.
+fn is_partial_download(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "crdownload" | "part" | "download" | "opdownload"
+    )
+}
+
+// Installer file names usually carry versions and platform tags, e.g.
+// `Firefox 131.0.dmg` or `Docker-arm64.dmg`. Keep the leading name tokens.
+fn installer_product_key(path: &Path) -> String {
+    const NOISE: [&str; 16] = [
+        "mac",
+        "macos",
+        "osx",
+        "darwin",
+        "universal",
+        "arm64",
+        "aarch64",
+        "x64",
+        "x86",
+        "intel",
+        "apple",
+        "silicon",
+        "installer",
+        "setup",
+        "latest",
+        "stable",
+    ];
+    let stem = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut key = String::new();
+    for token in stem.split(|character: char| !character.is_alphanumeric()) {
+        let token = token.to_lowercase();
+        if token.is_empty() {
+            continue;
+        }
+        if token.starts_with(|character: char| character.is_ascii_digit())
+            || NOISE.contains(&token.as_str())
+            || (token.starts_with('v') && token[1..].starts_with(|c: char| c.is_ascii_digit()))
+        {
+            break;
+        }
+        key.push_str(&token);
+    }
+    key.strip_prefix("install").unwrap_or(&key).to_string()
+}
+
+fn installed_app_for_installer<'a>(
+    apps: &'a AppInventory,
+    path: &Path,
+) -> Option<&'a InstalledApp> {
+    let key = installer_product_key(path);
+    if key.chars().count() < 3 {
+        return None;
+    }
+    apps.apps.iter().find(|app| {
+        [
+            normalized_name(&app.name),
+            normalized_name(&file_name(&app.path)),
+        ]
+        .iter()
+        .any(|name| {
+            name.chars().count() >= 3
+                && (key == *name
+                    || key.strip_prefix(name.as_str()).is_some_and(|rest| {
+                        matches!(rest, "mac" | "macos" | "osx" | "installer" | "setup")
+                    }))
+        })
+    })
+}
+
+// Download and build caches that hold nothing but regenerable artifacts. The
+// owning tool must not be running (already enforced before registration).
+fn pure_regenerable_cache(home: &Path, root: &Path, owner: &str) -> bool {
+    let fixed = fixed_cache_sources(home)
+        .iter()
+        .any(|(path, name)| path == root && *name == owner);
+    if fixed {
+        // pnpm's store is hard-linked into projects; prefer `pnpm store prune`.
+        return owner != "pnpm";
+    }
+    // Chromium/Electron HTTP, shader and V8 code caches outside sandbox containers.
+    APP_CACHE_FOLDERS.iter().any(|folder| {
+        root == home
+            .join("Library/Application Support")
+            .join(owner)
+            .join(folder)
+    })
+}
+
+fn cache_impact(owner: &str) -> &'static str {
+    match owner {
+        "Xcode" => "下次编译会重新构建，首次编译变慢。",
+        "Google Chrome" | "Firefox" | "Microsoft Edge" | "Safari" => {
+            "网页首次打开会稍慢；不影响登录、历史记录、书签和密码。"
+        }
+        "npm" | "pip" | "uv" | "node-gyp" | "Yarn" | "pnpm" | "Cargo" | "Go" | "Gradle"
+        | "Homebrew" | "CocoaPods" => "下次安装依赖时会重新下载，离线时可能无法安装。",
+        _ => "应用下次启动时会重新生成，首次打开可能稍慢。",
+    }
+}
+
 fn is_log(path: &Path) -> bool {
     let name = file_name(path).to_ascii_lowercase();
     [".log", ".txt", ".crash", ".ips", ".out", ".err", ".trace"]
@@ -905,19 +1020,40 @@ fn running_app_paths() -> Result<HashSet<PathBuf>, String> {
             if application.isTerminated() {
                 continue;
             }
+            let file_path = |url: &objc2_foundation::NSURL| {
+                let path =
+                    unsafe { std::ffi::CStr::from_ptr(url.fileSystemRepresentation().as_ptr()) };
+                use std::os::unix::ffi::OsStrExt;
+                PathBuf::from(std::ffi::OsStr::from_bytes(path.to_bytes()))
+            };
             match application.bundleURL() {
                 Some(url) if url.isFileURL() => {
-                    let path = unsafe {
-                        std::ffi::CStr::from_ptr(url.fileSystemRepresentation().as_ptr())
-                    };
-                    use std::os::unix::ffi::OsStrExt;
-                    let path = PathBuf::from(std::ffi::OsStr::from_bytes(path.to_bytes()));
+                    let path = file_path(&url);
                     if !path.is_absolute() {
                         return Err("系统返回的应用位置无效，暂不能确认清理。".into());
                     }
-                    paths.insert(path);
+                    // Unbundled GUI processes (for example a Java app) report
+                    // their executable here. Track only an enclosing app bundle.
+                    if is_app_bundle(&path) {
+                        paths.insert(path);
+                    } else if let Some(bundle) = app_bundle_from_executable(&path)? {
+                        paths.insert(bundle);
+                    }
                 }
                 None if application.bundleIdentifier().is_none() => {}
+                // XPC helpers such as WebKit's WebContent carry an identifier but
+                // no bundle URL. Locate the enclosing app from the executable.
+                None => match application.executableURL() {
+                    Some(url) if url.isFileURL() && file_path(&url).is_absolute() => {
+                        if let Some(bundle) = app_bundle_from_executable(&file_path(&url))? {
+                            paths.insert(bundle);
+                        }
+                    }
+                    _ if application
+                        .bundleIdentifier()
+                        .is_some_and(|id| protected_label(&id.to_string())) => {}
+                    _ => return Err("无法完整取得正在运行应用的位置，暂不能确认清理。".into()),
+                },
                 _ => return Err("无法完整取得正在运行应用的位置，暂不能确认清理。".into()),
             }
         }
@@ -1001,7 +1137,7 @@ fn current_user_process_ids() -> Result<HashSet<i32>, String> {
 }
 
 #[cfg(target_os = "macos")]
-fn native_process_info(pid: i32) -> Result<Option<libc::proc_bsdinfo>, String> {
+fn native_process_info(pid: i32) -> Result<Option<libc::proc_bsdinfo>, (String, Option<i32>)> {
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
     let size = std::mem::size_of::<libc::proc_bsdinfo>();
     // SAFETY: info is aligned, writable storage for exactly size bytes.
@@ -1019,14 +1155,18 @@ fn native_process_info(pid: i32) -> Result<Option<libc::proc_bsdinfo>, String> {
         if bytes == 0 && error.raw_os_error() == Some(libc::ESRCH) {
             return Ok(None); // The process exited between enumeration and lookup.
         }
-        return Err(format!(
-            "无法验证用户进程 {pid}：{error}。暂不能安全确认清理。"
+        return Err((
+            format!("无法验证用户进程 {pid}：{error}。暂不能安全确认清理。"),
+            error.raw_os_error(),
         ));
     }
     // SAFETY: proc_pidinfo returned the full initialized structure.
     let info = unsafe { info.assume_init() };
     if info.pbi_pid != pid as u32 {
-        return Err("系统返回的进程标识不一致，暂不能安全确认清理。".into());
+        return Err((
+            "系统返回的进程标识不一致，暂不能安全确认清理。".into(),
+            None,
+        ));
     }
     Ok(Some(info))
 }
@@ -1055,8 +1195,17 @@ fn native_process_path(pid: i32) -> Result<PathBuf, io::Error> {
 
 #[cfg(target_os = "macos")]
 fn native_process_executable(pid: i32) -> Result<Option<PathBuf>, String> {
-    let Some(before) = native_process_info(pid)? else {
-        return Ok(None);
+    let before = match native_process_info(pid) {
+        Ok(Some(info)) => info,
+        Ok(None) => return Ok(None),
+        // Setuid processes the user started (for example `/usr/bin/login` under
+        // Terminal) hide their BSD info, but their executable path is public.
+        // Return that path: one outside an app bundle is irrelevant, and one
+        // inside a bundle conservatively counts as a running application.
+        Err((error, Some(libc::EPERM))) => {
+            return native_process_path(pid).map(Some).map_err(|_| error);
+        }
+        Err((error, _)) => return Err(error),
     };
     // SAFETY: getuid/geteuid take no arguments and have no memory preconditions.
     let (uid, ruid) = unsafe { (libc::geteuid(), libc::getuid()) };
@@ -1064,7 +1213,7 @@ fn native_process_executable(pid: i32) -> Result<Option<PathBuf>, String> {
         return Ok(None);
     }
     let path = native_process_path(pid);
-    let Some(after) = native_process_info(pid)? else {
+    let Some(after) = native_process_info(pid).map_err(|(error, _)| error)? else {
         return Ok(None);
     };
     if after.pbi_status == libc::SZOMB {
@@ -1287,10 +1436,24 @@ fn add_candidate<F: Fn(ScanProgress)>(
         || orphan_id.is_some()
         || matches!(
             rule,
-            Rule::Installer | Rule::OrphanMetadata | Rule::OrphanPreference | Rule::OrphanState
+            Rule::Installer
+                | Rule::PartialDownload
+                | Rule::OrphanMetadata
+                | Rule::OrphanPreference
+                | Rule::OrphanState
         );
     let category = candidate_category(rule, orphan_id.as_deref());
-    let reason = if extra_cache {
+    let installed = matches!(rule, Rule::Installer)
+        .then(|| installed_app_for_installer(apps, path))
+        .flatten();
+    let pure_cache = extra_cache && pure_regenerable_cache(&snapshot.home, root, owner_name);
+    let reason = if pure_cache {
+        "只包含可重新生成的下载、编译或网页缓存，不含账户、设置或文档；候选及全部子项均超过保留天数，相关工具当前未运行。"
+    } else if matches!(rule, Rule::PartialDownload) {
+        "未完成的浏览器下载，超过保留天数且没有继续下载；这类临时文件无法直接打开或使用。"
+    } else if installed.is_some() {
+        "下载目录中的旧安装包，对应的应用已经安装在本机；安装包本身不再参与运行。"
+    } else if extra_cache {
         "已知可重新生成的下载、编译或应用缓存，候选及全部子项均超过保留天数。可能影响离线工作、首次打开或重新编译；先退出相关工具并手动确认。不会包含整个应用数据目录。"
     } else if matches!(rule, Rule::OrphanState) {
         "疑似已卸载应用留下的窗口恢复状态。未找到同标识或同开发者的应用并不证明已经卸载，可能影响恢复上次打开的窗口；需手动确认。"
@@ -1310,6 +1473,42 @@ fn add_candidate<F: Fn(ScanProgress)>(
             _ => "疑似旧偏好元数据，需要手动核对。",
         }
     };
+    // `risk` keeps the default-selection policy; `safety` is the clearer
+    // deletability verdict shown to the user. Uncertain ownership or an
+    // incomplete running-app list never yields a `safe` verdict.
+    let uncertain = !apps.active_complete || apps.owner_uncertain(owner_name);
+    let safety = if !review {
+        "safe"
+    } else if matches!(rule, Rule::OrphanMetadata) {
+        "caution"
+    } else if !uncertain
+        && (pure_cache || installed.is_some() || matches!(rule, Rule::PartialDownload))
+    {
+        "safe"
+    } else {
+        "review"
+    };
+    let impact = match rule {
+        Rule::Cache | Rule::RebuildableCache if orphan_id.is_some() => {
+            "对应应用似乎已卸载；若仍在使用，下次启动会重新生成缓存。".to_string()
+        }
+        Rule::RebuildableCache if pure_cache => cache_impact(owner_name).to_string(),
+        Rule::Cache | Rule::RebuildableCache if runtime_cache || extra_cache => {
+            "可能需要重新下载；离线工作或正在引用它的项目可能受影响。".to_string()
+        }
+        Rule::Cache | Rule::RebuildableCache => cache_impact(owner_name).to_string(),
+        Rule::Log => "无法再查看这些旧日志或崩溃报告。".to_string(),
+        Rule::Installer => match installed {
+            Some(app) => format!("已安装「{}」；以后重装需要重新下载安装包。", app.name),
+            None => "未找到对应的已安装应用；可能还没安装，或留作离线重装。".to_string(),
+        },
+        Rule::PartialDownload => "下载需要重新开始。".to_string(),
+        Rule::OrphanPreference => "若以后重新安装该应用，设置会恢复默认。".to_string(),
+        Rule::OrphanState => "该应用不会恢复上次打开的窗口。".to_string(),
+        Rule::OrphanMetadata => {
+            "可能包含该应用的设置、文档或账户数据；放回前，应用内无法找回。".to_string()
+        }
+    };
     let app = apps.related(owner_name);
     let id = format!(
         "{}-{}",
@@ -1327,6 +1526,8 @@ fn add_candidate<F: Fn(ScanProgress)>(
         is_directory: fingerprint.mode & 0o170_000 == 0o040_000,
         modified_at: manifest.newest,
         reason: reason.into(),
+        safety,
+        impact,
         selected_by_default: !review,
         app_name: app
             .map(|app| app.name.clone())
@@ -1363,6 +1564,7 @@ fn candidate_category(rule: Rule, orphan_id: Option<&str>) -> &'static str {
         Rule::Cache | Rule::RebuildableCache => "cache",
         Rule::Log => "logs",
         Rule::Installer => "installer",
+        Rule::PartialDownload => "download",
         _ => "orphan",
     }
 }
@@ -1712,20 +1914,25 @@ pub fn scan(
                 if ctx.stopped {
                     break;
                 }
-                if is_installer(&child) {
-                    let owner = file_name(&child);
-                    add_candidate(
-                        &mut snapshot,
-                        &mut ctx,
-                        &apps,
-                        &child,
-                        &downloads,
-                        Rule::Installer,
-                        None,
-                        &owner,
-                        None,
-                    );
-                }
+                let rule = if is_installer(&child) {
+                    Rule::Installer
+                } else if is_partial_download(&child) {
+                    Rule::PartialDownload
+                } else {
+                    continue;
+                };
+                let owner = file_name(&child);
+                add_candidate(
+                    &mut snapshot,
+                    &mut ctx,
+                    &apps,
+                    &child,
+                    &downloads,
+                    rule,
+                    None,
+                    &owner,
+                    None,
+                );
             }
         }
     }
@@ -1862,7 +2069,7 @@ fn validate_item(
         }
         Rule::RebuildableCache => return Err("缓存路径不在已知规则范围内。".into()),
         Rule::Log => snapshot.home.join("Library/Logs"),
-        Rule::Installer => snapshot.home.join("Downloads"),
+        Rule::Installer | Rule::PartialDownload => snapshot.home.join("Downloads"),
         Rule::OrphanPreference => snapshot.home.join("Library/Preferences"),
         Rule::OrphanMetadata => snapshot.home.join("Library/Application Support"),
         Rule::OrphanState => snapshot.home.join("Library/Saved Application State"),
@@ -2141,7 +2348,7 @@ mod tests {
                 Rule::Cache => self.home.join("Library/Caches"),
                 Rule::RebuildableCache => self.home.join(".npm/_cacache"),
                 Rule::Log => self.home.join("Library/Logs"),
-                Rule::Installer => self.home.join("Downloads"),
+                Rule::Installer | Rule::PartialDownload => self.home.join("Downloads"),
                 Rule::OrphanPreference => self.home.join("Library/Preferences"),
                 Rule::OrphanMetadata => self.home.join("Library/Application Support"),
                 Rule::OrphanState => self.home.join("Library/Saved Application State"),
@@ -2157,6 +2364,8 @@ mod tests {
                 is_directory: fingerprint.mode & 0o170_000 == 0o040_000,
                 modified_at: manifest.newest,
                 reason: "fixture".into(),
+                safety: "safe",
+                impact: "fixture".into(),
                 selected_by_default: true,
                 app_name: None,
                 bundle_id: None,
@@ -2205,6 +2414,81 @@ mod tests {
             active_apps: vec![],
             active_complete: true,
         }
+    }
+
+    #[test]
+    fn installers_match_installed_apps_and_partial_downloads_are_recognised() {
+        let app = |name: &str| InstalledApp {
+            id: format!("com.example.{}", normalized_name(name)),
+            name: name.into(),
+            path: PathBuf::from(format!("/Applications/{name}.app")),
+        };
+        let apps = AppInventory {
+            apps: vec![
+                app("Google Chrome"),
+                app("Docker"),
+                app("WeChat"),
+                app("Go"),
+            ],
+            ..no_apps()
+        };
+        let installed = |file: &str| {
+            installed_app_for_installer(&apps, Path::new(file)).map(|app| app.name.clone())
+        };
+        assert_eq!(
+            installed("googlechrome.dmg").as_deref(),
+            Some("Google Chrome")
+        );
+        assert_eq!(installed("Docker-arm64.dmg").as_deref(), Some("Docker"));
+        assert_eq!(installed("Docker 4.31.0.dmg").as_deref(), Some("Docker"));
+        assert_eq!(installed("WeChatMac.dmg").as_deref(), Some("WeChat"));
+        assert_eq!(installed("Install Docker.pkg").as_deref(), Some("Docker"));
+        // Short or unrelated names never claim an installed owner.
+        assert_eq!(installed("Go1.22.pkg"), None);
+        assert_eq!(installed("DockerDesktopBackup.dmg"), None);
+        assert_eq!(installed("OtherTool.pkg"), None);
+
+        assert!(is_partial_download(Path::new("movie.mp4.crdownload")));
+        assert!(is_partial_download(Path::new("archive.zip.part")));
+        assert!(is_partial_download(Path::new("photo.jpg.download")));
+        assert!(!is_partial_download(Path::new("notes.part1.rar")));
+        assert!(!is_installer(Path::new("movie.mp4.crdownload")));
+    }
+
+    #[test]
+    fn only_known_regenerable_cache_roots_are_rated_safe() {
+        let home = Path::new("/Users/example");
+        assert!(pure_regenerable_cache(
+            home,
+            &home.join(".npm/_cacache"),
+            "npm"
+        ));
+        assert!(pure_regenerable_cache(
+            home,
+            &home.join("Library/Developer/Xcode/DerivedData"),
+            "Xcode"
+        ));
+        assert!(pure_regenerable_cache(
+            home,
+            &home.join("Library/Application Support/Slack/GPUCache"),
+            "Slack"
+        ));
+        // pnpm's store is hard-linked into projects and sandbox caches can hold state.
+        assert!(!pure_regenerable_cache(
+            home,
+            &home.join("Library/pnpm/store"),
+            "pnpm"
+        ));
+        assert!(!pure_regenerable_cache(
+            home,
+            &home.join("Library/Containers/com.example.app/Data/Library/Caches"),
+            "com.example.app"
+        ));
+        assert!(!pure_regenerable_cache(
+            home,
+            &home.join("Library/Application Support/Slack/IndexedDB"),
+            "Slack"
+        ));
     }
 
     #[test]

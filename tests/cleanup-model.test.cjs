@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { groupItems, buildDirectoryTree, selectedState, pageItems } = require('../frontend/cleanup-model.js');
+const { groupItems, buildDirectoryTree, selectedState, pageItems, safetyOf } = require('../frontend/cleanup-model.js');
 
 const item = (id, overrides = {}) => ({ id, appName: 'Example', category: 'cache', selectedByDefault: true, bytes: 4096, modifiedAt: 100, ...overrides });
 
@@ -207,4 +207,17 @@ test('npm Cargo and sandbox cache branches share their exact cache roots without
   assert.deepEqual(new Set(roots.map((root) => root.path)), new Set(cases.map((fixture) => fixture.root)));
   assert.deepEqual(new Set(roots.flatMap((root) => root.itemIds)), new Set(allItems.map((file) => file.id)));
   assert.equal(roots.reduce((bytes, root) => bytes + root.bytes, 0), allItems.reduce((bytes, file) => bytes + file.bytes, 0));
+});
+
+test('safety verdicts split groups, order safe first and fall back for older reports', () => {
+  assert.equal(safetyOf(item('legacy-suggested')), 'safe');
+  assert.equal(safetyOf(item('legacy-manual', { selectedByDefault: false })), 'review');
+  assert.equal(safetyOf(item('unknown', { selectedByDefault: false, safety: 'whatever' })), 'review');
+  const groups = groupItems([
+    item('caution', { selectedByDefault: false, safety: 'caution', bytes: 9000 }),
+    item('review', { selectedByDefault: false, safety: 'review', bytes: 8000 }),
+    item('safe-manual', { selectedByDefault: false, safety: 'safe', bytes: 7000 }),
+    item('safe-default', { safety: 'safe', bytes: 10 }),
+  ]);
+  assert.deepEqual(groups.map((group) => [group.safety, group.suggested]), [['safe', true], ['safe', false], ['review', false], ['caution', false]]);
 });
